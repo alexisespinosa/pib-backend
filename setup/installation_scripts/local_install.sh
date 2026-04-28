@@ -4,7 +4,7 @@ PIB_API_DIR="$HOME/flask"
 PIB_API_SETUP_DIR="$BACKEND_DIR/pib_api"
 
 ROS_WORKING_DIR="$HOME/ros_working_dir"
-ROS_CAMERA_BOOT_DIR="$ROS_WORKING_DIR/src/camera/boot_scripts"
+ROS_VISION_BOOT_DIR="$ROS_WORKING_DIR/src/vision/boot_scripts"
 ROS_MOTORS_BOOT_DIR="$ROS_WORKING_DIR/src/motors/boot_scripts"
 ROS_VOICE_ASSISTANT_BOOT_DIR="$ROS_WORKING_DIR/src/voice_assistant/boot_scripts"
 ROS_PROGRAMS_BOOT_DIR="$ROS_WORKING_DIR/src/programs/boot_scripts"
@@ -191,10 +191,10 @@ function install_ros_packages() {
 
   print INFO "Setting up boot-services"
 
-  # Boot camera
-  sudo chmod 700 "$ROS_CAMERA_BOOT_DIR/ros_camera_boot.sh"
-  sudo chmod 700 "$ROS_CAMERA_BOOT_DIR/ros_camera_boot.service"
-  sudo cp "${ROS_CAMERA_BOOT_DIR}/ros_camera_boot.service" /etc/systemd/system
+  # Boot vision
+  sudo chmod 700 "$ROS_VISION_BOOT_DIR/ros_vision_boot.sh"
+  sudo chmod 700 "$ROS_VISION_BOOT_DIR/ros_vision_boot.service"
+  sudo cp "${ROS_VISION_BOOT_DIR}/ros_vision_boot.service" /etc/systemd/system
 
 
   # Boot motor nodes
@@ -363,7 +363,7 @@ install_blocky_node_service || { print ERROR "Failed installing blocky node serv
 sudo systemctl daemon-reload
 sudo systemctl enable pib_blockly_server_boot.service --now
 sudo systemctl enable pib_api_boot.service --now
-sudo systemctl enable ros_camera_boot.service --now
+sudo systemctl enable ros_vision_boot.service --now
 sudo systemctl enable ros_motor_boot.service --now
 sudo systemctl enable ros_program_boot.service --now
 sudo systemctl enable ros_voice_assistant_boot.service --now

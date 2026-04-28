@@ -44,16 +44,16 @@ services:
     ports:
       - "9090:9090"
 
-  ros-camera:
-    image: ros-camera
+  ros-vision:
+    image: ros-vision
     privileged: true
     build:
       context: ./ros_packages
-      dockerfile: ./camera/Dockerfile
-    command: ros2 run oak_d_lite stereo
+      dockerfile: ./vision/Dockerfile
+    command: ros2 run pib_vision vision_node
     profiles:
       - all
-      - camera
+      - vision
     # Volume binding should not be necessary here,
     # but removing will stop the camera from showing pictures for some reason
     volumes:

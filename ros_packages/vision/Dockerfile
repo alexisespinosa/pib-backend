@@ -3,7 +3,7 @@ SHELL ["/bin/bash", "-c"]
 
 WORKDIR /app
 COPY ./datatypes ros2_ws/datatypes
-COPY ./camera ros2_ws/camera
+COPY ./vision ros2_ws/vision
 
 RUN set -xe \
     && apt-get update \
