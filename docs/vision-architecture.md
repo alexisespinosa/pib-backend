@@ -172,12 +172,15 @@ Multi-PR effort. Order matters because each step depends on the previous:
 
 1. **This design doc**, merged to `feat/vision-architecture` branch in `pib-backend`. Becomes the contract.
 2. **`pib_vision_msgs` package** — only created if we discover during step 4 that `vision_msgs` doesn't cover something. Most likely we don't need this package for face detection alone.
-3. **`ros-vision` service**:
-   - Rename `ros-camera` → `ros-vision` (Docker compose service, package name).
-   - Update Compose, Dockerfile, dependencies (`vision_msgs` package, `tf2_ros`).
-   - Implement always-on topics (`raw_frame`, `raw_frame_b64`, `camera_info`).
-   - Implement face-detection capability with subscription-gating.
-   - Publish static TF (only `oak_d_lite_rgb` for now; identity transform for the device root).
+3. **`ros-vision` service** — built up across multiple commits on the same branch:
+   - **3.1** Rename `ros-camera` → `ros-vision` (Compose service, image, Python package, boot scripts, production setup script references). No behavior change.
+   - **3.2** Implement always-on topics: `/vision/raw_frame` (`sensor_msgs/CompressedImage`), `/vision/raw_frame_b64` (`std_msgs/String`), `/vision/camera_info` (`sensor_msgs/CameraInfo` latched). Keep the legacy `/camera_topic` publisher live so Cerebra doesn't break before step 4.
+   - **3.3** Publish static TF for `oak_d_lite_rgb` (and identity transform for the device root). Sourced from `device.readCalibration()` once at startup.
+   - **3.4** Implement face-detection capability — depthai NN node added to the pipeline, `/vision/face_detections` (`vision_msgs/Detection2DArray`) published behind a subscription-count gate (matched events preferred, polled `get_subscription_count()` as fallback).
+   - **3.5** **Restructure checkpoint.** After 3.4, evaluate `vision_node.py`. Trigger thresholds for splitting into modules (e.g. `vision_node.py` + `pipeline.py` + `publishers/{raw_frame,face_detection,camera_info,tf}.py`):
+     - File exceeds ~400 LOC and reading it requires scrolling between unrelated concerns, **or**
+     - The next lazy capability is queued and the subscription-gating logic would be duplicated.
+     If neither trigger fires, defer the restructure to whichever future commit first hits one. The point is to let the structure be motivated by real duplication, not by speculation about what publishers might want in common.
 4. **Cerebra adjustment** — update the camera page topic name from `camera_topic` to `/vision/raw_frame_b64`.
 5. **Blockly generator refactor** — `face_detector_start_stop` and `face_detector_running` (in `pib-blockly`) emit ROS subscriber code instead of depthai pipeline. The `FaceDetector` class declaration in `function-declarations.ts` is removed.
 6. **Programs container slim-down** — remove the dependencies that user programs no longer need (none added, but document that cv2/depthai/blobconverter must NOT be added back for vision purposes).
