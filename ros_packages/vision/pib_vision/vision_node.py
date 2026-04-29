@@ -6,7 +6,21 @@ import depthai as dai
 import rclpy
 from datatypes.srv import GetCameraImage
 from rclpy.node import Node
-from std_msgs.msg import String, Float64, Int32, Int32MultiArray
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
+from sensor_msgs.msg import CameraInfo, CompressedImage
+from std_msgs.msg import Float64, Int32, Int32MultiArray, String
+
+# All measurements published by this node carry this frame_id.
+# Future sensors (left/right mono, depth) will get sibling frame_ids.
+FRAME_ID = "oak_d_lite_rgb"
+
+# Latched QoS: late subscribers immediately receive the most recent message.
+# Used for CameraInfo since intrinsics are static after device-open.
+LATCHED_QOS = QoSProfile(
+    depth=1,
+    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+    history=HistoryPolicy.KEEP_LAST,
+)
 
 
 class ErrorPublisher(Node):
@@ -32,7 +46,22 @@ class CameraNode(Node):
 
     def __init__(self):
         super().__init__("camera_node")
-        self.publisher_ = self.create_publisher(String, "camera_topic", 10)
+        # Legacy publisher — kept until Cerebra migrates to /vision/raw_frame_b64
+        # (step 4 of docs/vision-architecture.md migration plan).
+        self.legacy_camera_topic_pub = self.create_publisher(
+            String, "camera_topic", 10
+        )
+        # Always-on /vision/* topics (sub-step 3.2 of the migration plan).
+        self.raw_frame_pub = self.create_publisher(
+            CompressedImage, "/vision/raw_frame", 10
+        )
+        self.raw_frame_b64_pub = self.create_publisher(
+            String, "/vision/raw_frame_b64", 10
+        )
+        self.camera_info_pub = self.create_publisher(
+            CameraInfo, "/vision/camera_info", LATCHED_QOS
+        )
+
         self.timer_subscription = self.create_subscription(
             Float64, "timer_period_topic", self.timer_period_callback, 10
         )
@@ -55,6 +84,7 @@ class CameraNode(Node):
             self.get_camera_image_service = self.create_service(
                 GetCameraImage, "get_camera_image", self.get_camera_image_callback
             )
+            self.publish_camera_info()
             self.get_logger().info("Camera service initialized.")
         else:
             self.get_logger().error("Camera not available.")
@@ -96,6 +126,42 @@ class CameraNode(Node):
             self.queue = None
             return False
 
+    def publish_camera_info(self):
+        """Publish a latched CameraInfo built from the OAK-D's on-device calibration."""
+        try:
+            calib = self.device.readCalibration()
+            K = calib.getCameraIntrinsics(
+                dai.CameraBoardSocket.CAM_A, self.preview_width, self.preview_height
+            )
+            distortion = calib.getDistortionCoefficients(dai.CameraBoardSocket.CAM_A)
+        except Exception as e:
+            self.get_logger().error(f"Failed to read calibration for CameraInfo: {e}")
+            return
+
+        msg = CameraInfo()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = FRAME_ID
+        msg.width = self.preview_width
+        msg.height = self.preview_height
+        # depthai returns 14 distortion coefficients; OpenCV's plumb_bob model
+        # uses the first 5 (k1, k2, p1, p2, k3).
+        msg.distortion_model = "plumb_bob"
+        msg.d = [float(d) for d in distortion[:5]]
+        msg.k = [float(v) for row in K for v in row]
+        # No rectification for a single (non-stereo) camera.
+        msg.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        # Projection P = [K | 0] for an unrectified single camera.
+        msg.p = [
+            float(K[0][0]), float(K[0][1]), float(K[0][2]), 0.0,
+            float(K[1][0]), float(K[1][1]), float(K[1][2]), 0.0,
+            float(K[2][0]), float(K[2][1]), float(K[2][2]), 0.0,
+        ]
+        self.camera_info_pub.publish(msg)
+        self.get_logger().info(
+            f"Published CameraInfo: {msg.width}x{msg.height} "
+            f"fx={K[0][0]:.1f} fy={K[1][1]:.1f} cx={K[0][2]:.1f} cy={K[1][2]:.1f}"
+        )
+
     def timer_callback(self):
         if not self.queue:
             return
@@ -105,16 +171,36 @@ class CameraNode(Node):
         # data is originally represented as a flat 1D array, it needs to be converted into HxWxC form
         frame = image_rgb.getCvFrame()
 
-        # Convert the image to base64
-        retval, buffer = cv2.imencode(
+        # Encode once, publish to all three topics.
+        ok, buffer = cv2.imencode(
             ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.quality_factor]
         )
-        jpg_as_text = base64.b64encode(buffer)
+        if not ok:
+            self.get_logger().warn("cv2.imencode returned failure; dropping frame")
+            return
+        jpg_bytes = buffer.tobytes()
+        jpg_b64 = base64.b64encode(buffer).decode("utf-8")
 
-        msg = String()
-        msg.data = jpg_as_text.decode("utf-8")  # convert bytes to string
-        self.current_image = msg.data
-        self.publisher_.publish(msg)
+        stamp = self.get_clock().now().to_msg()
+
+        # Legacy /camera_topic (Cerebra still consumes this). Remove after step 4.
+        legacy_msg = String()
+        legacy_msg.data = jpg_b64
+        self.current_image = legacy_msg.data
+        self.legacy_camera_topic_pub.publish(legacy_msg)
+
+        # /vision/raw_frame (binary CompressedImage, ROS-native)
+        compressed_msg = CompressedImage()
+        compressed_msg.header.stamp = stamp
+        compressed_msg.header.frame_id = FRAME_ID
+        compressed_msg.format = "jpeg"
+        compressed_msg.data = jpg_bytes
+        self.raw_frame_pub.publish(compressed_msg)
+
+        # /vision/raw_frame_b64 (String, for Cerebra rosbridge after step 4)
+        b64_msg = String()
+        b64_msg.data = jpg_b64
+        self.raw_frame_b64_pub.publish(b64_msg)
 
     def timer_period_callback(self, msg):
         self.timer_period = msg.data
@@ -131,7 +217,9 @@ class CameraNode(Node):
 
         # Reset pipeline with new preview size
         self.device.close()
-        self.init_pipeline()
+        if self.init_pipeline():
+            # CameraInfo dimensions (and possibly intrinsics) changed — re-publish.
+            self.publish_camera_info()
 
 
 def spin_camera(times):
