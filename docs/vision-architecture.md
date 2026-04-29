@@ -134,14 +134,50 @@ For v1 (RGB-only, no depth), the only published transform is `oak_d_lite_link �
 - The pipeline runs continuously on the device while the device is open.
 - Subscription-driven activation gates *publishing*, not *inference*. No subscriber → host doesn't read the NN output queue and doesn't construct/publish messages. Saves host CPU and ROS bandwidth, but device compute is constant.
 - Trade-off: cheaper to implement, no glitches when capabilities toggle, but uses the device's NN compute capacity unconditionally.
-- Acceptable as long as total NN load fits the OAK-D Lite's 4 SHAVE cores. Face-detection alone uses one model — plenty of headroom.
 
-**v2** (when needed):
-- Pipeline rebuild on capability set change. Subscribing to a previously-quiet capability triggers `dai.Device.close()` + new pipeline construction + `dai.Device(new_pipeline)`. Brief outage (~1-3s) during reload, including raw frame streaming.
-- Necessary when total simultaneous NN load exceeds device capacity (~3-4 models depending on size).
-- Code is structured so the active capability set is a list — adding the rebuild trigger is a localized change, not a refactor.
+**v2** (when v1's hardware ceiling is exceeded):
+- Pipeline rebuild on capability set change. When the *first* subscriber appears on a previously-quiet capability topic, `dai.Device.close()` + new pipeline construction + `dai.Device(new_pipeline)`. When the *last* subscriber on a capability disappears, same — rebuild without that NN. Brief outage (~1-3s) during reload, including raw frame streaming.
+- Code is structured from v1 so the active capability set is already a list; adding the rebuild trigger is a localized change.
+
+**Concrete trigger for v2 — OAK-D Lite hardware ceiling:**
+
+The OAK-D Lite has **4 SHAVE cores** for NN inference. Empirically, simultaneous-model performance on the Lite degrades as follows (small detection models like MobileNet-SSD variants):
+
+| Models loaded | Per-model FPS | Practical? |
+|---|---|---|
+| 1 | ~30 fps | ✓ |
+| 2 | ~20 fps each | ✓ |
+| 3 | ~12-15 fps each | borderline |
+| 4+ | <10 fps each, contention growing | needs v2 |
+
+So the rule of thumb is: **v1 is fine up to ~2 simultaneously-loaded NN models on the Lite; v2 becomes necessary at the 3rd.** The exact crossover depends on per-model size, but face + person detection is comfortably v1; adding hand-keypoint or pose estimation as a third pushes us into v2 territory.
 
 The v1→v2 boundary is a runtime tuning, not an API change. Consumers don't notice.
+
+### 4.5 Model storage strategy
+
+NN models compiled for the OAK's MyriadX VPUs are `.blob` files. Two storage strategies, used together:
+
+**Curated zoo models — pre-baked at Docker build time** (`blobconverter.from_zoo()` invoked from the Dockerfile):
+- Models published to the Intel Open Model Zoo and supported by Luxonis's `blobconverter` Python package.
+- The Dockerfile triggers Luxonis's online compilation service at build time and caches the result in `/root/.cache/blobconverter/` inside the image.
+- Runtime: same `blobconverter.from_zoo(...)` call inside `vision_node.py` finds the cached blob and never touches the network.
+- The list of pre-baked models in the Dockerfile is the **manifest of officially-supported NN capabilities** for this image.
+- Adding a new official capability = one Dockerfile line + the corresponding pipeline / publisher code.
+
+**Custom (user-supplied) models — bind-mounted at runtime**:
+- For models not in Intel's zoo (a custom-trained dog recognizer, a fine-tuned pose model, etc.) the user provides their own `.blob` and points `ros-vision` at it via a config path.
+- Implementation: a host-side directory bind-mounted into the container (e.g. `/opt/pib/custom_blobs:/opt/pib/custom_blobs:ro` in `docker-compose.yaml`). `vision_node.py` looks for known custom-model paths at startup, loads them if present.
+- Skips the build-time Luxonis dependency for custom work. Lets advanced users iterate without rebuilding the image.
+
+**Why this hybrid:**
+- Built-in capabilities (face, person, …) are reproducible without internet at runtime — anyone cloning the repo gets a working pib after one build.
+- Custom capabilities are independently versioned and fast to iterate.
+- The Dockerfile manifest doubles as a discoverability surface — "what NN capabilities does this pib build support?" is answered by reading one file.
+
+**Pinning:** `blobconverter` itself is version-pinned in the Dockerfile (`==1.4.2`, matching `setup-pib.sh`'s `user_program_env`). Floating versions invite "worked yesterday, broken today" failures during Docker rebuilds.
+
+**Network dependency at build time:** the build needs internet to reach `blobconverter.luxonis.com` for the compile request. If it's down at build time, the build fails — preferable to silently falling back to a stale local cache, since out-of-band model updates are rare and noticing the failure is better than running with an unintended version.
 
 ## 5. What user programs see
 
