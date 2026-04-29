@@ -5,14 +5,19 @@ import cv2
 import depthai as dai
 import rclpy
 from datatypes.srv import GetCameraImage
+from geometry_msgs.msg import TransformStamped
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
 from sensor_msgs.msg import CameraInfo, CompressedImage
 from std_msgs.msg import Float64, Int32, Int32MultiArray, String
+from tf2_ros import StaticTransformBroadcaster
 
-# All measurements published by this node carry this frame_id.
+# All RGB-derived measurements published by this node carry this frame_id.
 # Future sensors (left/right mono, depth) will get sibling frame_ids.
 FRAME_ID = "oak_d_lite_rgb"
+# Logical root of the OAK-D's internal TF subtree. NOT connected to any
+# robot-body frame here — see docs/vision-architecture.md §4.3.
+DEVICE_FRAME_ID = "oak_d_lite_link"
 
 # Latched QoS: late subscribers immediately receive the most recent message.
 # Used for CameraInfo since intrinsics are static after device-open.
@@ -62,6 +67,8 @@ class CameraNode(Node):
             CameraInfo, "/vision/camera_info", LATCHED_QOS
         )
 
+        self.tf_broadcaster = StaticTransformBroadcaster(self)
+
         self.timer_subscription = self.create_subscription(
             Float64, "timer_period_topic", self.timer_period_callback, 10
         )
@@ -85,6 +92,7 @@ class CameraNode(Node):
                 GetCameraImage, "get_camera_image", self.get_camera_image_callback
             )
             self.publish_camera_info()
+            self.publish_static_transforms()
             self.get_logger().info("Camera service initialized.")
         else:
             self.get_logger().error("Camera not available.")
@@ -160,6 +168,28 @@ class CameraNode(Node):
         self.get_logger().info(
             f"Published CameraInfo: {msg.width}x{msg.height} "
             f"fx={K[0][0]:.1f} fy={K[1][1]:.1f} cx={K[0][2]:.1f} cy={K[1][2]:.1f}"
+        )
+
+    def publish_static_transforms(self):
+        """Publish the OAK-D's internal TF subtree.
+
+        v1: a single identity transform oak_d_lite_link -> oak_d_lite_rgb.
+        Future stereo/depth capabilities add sibling transforms here using
+        depthai's `getCameraExtrinsics()` for the actual physical offsets.
+
+        Intentionally does NOT connect oak_d_lite_link to any robot-body
+        frame (e.g. pib_base_link) — that is owned by a future
+        robot-description publisher with the actual mounting measurement.
+        """
+        t = TransformStamped()
+        t.header.stamp = self.get_clock().now().to_msg()
+        t.header.frame_id = DEVICE_FRAME_ID
+        t.child_frame_id = FRAME_ID
+        # Identity: translation defaults to (0,0,0); set quaternion to (0,0,0,1).
+        t.transform.rotation.w = 1.0
+        self.tf_broadcaster.sendTransform(t)
+        self.get_logger().info(
+            f"Published static TF: {DEVICE_FRAME_ID} -> {FRAME_ID} (identity)"
         )
 
     def timer_callback(self):

@@ -115,6 +115,7 @@ Each measurement's `Header` carries the `frame_id` of the optical sensor that pr
 
 | frame_id | sensor | when used |
 |---|---|---|
+| `oak_d_lite_link` | device root | TF parent of all OAK-internal optical frames |
 | `oak_d_lite_rgb` | RGB camera | raw_frame, all 2D detections (NN models run on RGB) |
 | `oak_d_lite_left` | left mono | future stereo / depth source |
 | `oak_d_lite_right` | right mono | future stereo / depth source |
@@ -122,7 +123,9 @@ Each measurement's `Header` carries the `frame_id` of the optical sensor that pr
 
 Static transforms between these frames come from depthai's calibration data on the device (`device.readCalibration()`). They are published once at startup via `tf2_ros.StaticTransformBroadcaster`. This makes downstream nodes able to convert "a face at pixel (300, 200) in `oak_d_lite_rgb`" into a 3D position in `oak_d_lite_depth` once depth is implemented.
 
-For v1 (RGB-only, no depth), only `oak_d_lite_rgb` is in use, but every published Header carries it consistently so consumers don't need code changes when depth comes online.
+For v1 (RGB-only, no depth), the only published transform is `oak_d_lite_link → oak_d_lite_rgb` as identity. Sibling transforms (`oak_d_lite_link → oak_d_lite_left/right/depth`) are added when those capabilities come online, sourced from `getCameraExtrinsics()`.
+
+**Scope limit**: `ros-vision` deliberately does NOT publish a transform connecting `oak_d_lite_link` to any robot-body frame (e.g. `pib_base_link`). That edge of the TF tree is owned by a future robot-description publisher (URDF + `robot_state_publisher`, or a dedicated `ros-pib-state` node) which has the actual measurement of how the OAK-D is mounted on pib. Until that exists, consumers asking "where is this face in pib's body frame?" will receive a TF lookup error — which is the honest answer. Publishing a placeholder identity transform there would silently produce wrong-but-consistent positions; we'd rather have a loud error.
 
 ### 4.4 v1 vs v2 implementation strategy
 
