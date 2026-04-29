@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 import base64
+import time
 
 import depthai as dai
 import rclpy
@@ -25,6 +26,11 @@ LATCHED_QOS = QoSProfile(
     durability=DurabilityPolicy.TRANSIENT_LOCAL,
     history=HistoryPolicy.KEEP_LAST,
 )
+
+# How long to wait between retries when the OAK-D's USB connection is in
+# the "device in use" state (typically right after a prior process closed
+# the connection — USB takes a few seconds to fully release).
+RETRY_DELAY_SECONDS = 5
 
 
 class ErrorPublisher(Node):
@@ -263,20 +269,29 @@ def spin_camera(times):
             "Couldn't restart camera due to displayed error/s, publishing error message"
         )
         rclpy.spin(error_publisher)
-    else:
-        try:
-            camera_node = CameraNode()
-            rclpy.spin(camera_node)
-        except Exception as exc:
-            error_publisher.timer_callback()
-            print(exc)
-        finally:
-            if "camera_node" in locals():
-                camera_node.destroy_node()
-                print("camera_node destroyed")
-            cnt = times - 1
-            print("Retry starting camera..." + str(cnt))
-            spin_camera(cnt)
+        return
+    try:
+        camera_node = CameraNode()
+        if not camera_node.camera_available:
+            # init_pipeline failed (commonly "device in use" right after a
+            # restart). Trigger the retry path below by raising — without
+            # this, rclpy.spin would block forever on a node with no
+            # working pipeline.
+            raise RuntimeError("OAK-D pipeline init failed; will retry")
+        rclpy.spin(camera_node)
+    except Exception as exc:
+        error_publisher.timer_callback()
+        print(exc)
+    finally:
+        if "camera_node" in locals():
+            camera_node.destroy_node()
+            print("camera_node destroyed")
+        cnt = times - 1
+        print(
+            f"Retry starting camera in {RETRY_DELAY_SECONDS}s... ({cnt} attempt(s) left)"
+        )
+        time.sleep(RETRY_DELAY_SECONDS)
+        spin_camera(cnt)
     return
 
 
