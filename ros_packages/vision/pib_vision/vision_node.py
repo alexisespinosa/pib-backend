@@ -2,6 +2,7 @@
 import base64
 import time
 
+import blobconverter
 import depthai as dai
 import rclpy
 from datatypes.srv import GetCameraImage
@@ -11,6 +12,7 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
 from sensor_msgs.msg import CameraInfo, CompressedImage
 from std_msgs.msg import Float64, Int32, Int32MultiArray, String
 from tf2_ros import StaticTransformBroadcaster
+from vision_msgs.msg import Detection2D, Detection2DArray, ObjectHypothesisWithPose
 
 # All RGB-derived measurements published by this node carry this frame_id.
 # Future sensors (left/right mono, depth) will get sibling frame_ids.
@@ -31,6 +33,23 @@ LATCHED_QOS = QoSProfile(
 # the "device in use" state (typically right after a prior process closed
 # the connection — USB takes a few seconds to fully release).
 RETRY_DELAY_SECONDS = 5
+
+# --- Face detection capability (sub-step 3.4) -----------------------------
+# Curated zoo model pre-baked at Docker build time per §4.5 of the design
+# doc. blobconverter.from_zoo() at runtime is a cache hit (no network).
+FACE_NN_NAME = "face-detection-retail-0004"
+FACE_NN_SHAVES = 6
+FACE_NN_INPUT_SIZE = 300            # the model expects 300x300 RGB
+FACE_NN_CONFIDENCE_THRESHOLD = 0.5
+# vision_msgs/ObjectHypothesis class label. Single class; no class id space
+# to share with other capabilities.
+FACE_CLASS_ID = "face"
+
+# Polling interval for subscriber-count gating of lazy capabilities.
+# Trade-off: longer interval = less idle CPU, longer activation latency.
+# 1s is fine for human-driven subscribe events (Cerebra page open, user
+# program start). For event-driven activation we'd switch to MatchedEvent.
+SUBSCRIBER_POLL_PERIOD_S = 1.0
 
 
 class ErrorPublisher(Node):
@@ -72,6 +91,14 @@ class CameraNode(Node):
             CameraInfo, "/vision/camera_info", LATCHED_QOS
         )
 
+        # Lazy capability: face detections (sub-step 3.4). Publishing is gated
+        # by subscriber count via _check_lazy_subscribers() below. NN inference
+        # itself runs on the OAK device unconditionally per the v1 design.
+        self.face_detections_pub = self.create_publisher(
+            Detection2DArray, "/vision/face_detections", 10
+        )
+        self._face_publishing = False
+
         self.tf_broadcaster = StaticTransformBroadcaster(self)
 
         self.timer_subscription = self.create_subscription(
@@ -105,6 +132,11 @@ class CameraNode(Node):
         self.timer_period = 0.1  # seconds
         self.timer = self.create_timer(self.timer_period, self.timer_callback)
 
+        # Subscriber-count poll for lazy capability gating.
+        self.subscriber_poll_timer = self.create_timer(
+            SUBSCRIBER_POLL_PERIOD_S, self._check_lazy_subscribers
+        )
+
     def get_camera_image_callback(self, request, response):
         self.get_logger().info(f"LEN IMAGE: {len(self.current_image)}")
         response.image_base64 = self.current_image
@@ -114,14 +146,20 @@ class CameraNode(Node):
         try:
             self.pipeline = dai.Pipeline()
 
-            # Color camera. Video output goes to the on-device MJPEG encoder
-            # below; preview output is reserved for NN inputs (sub-step 3.4).
+            # Color camera shared by two outputs:
+            #   .video    -> on-device MJPEG encoder (always-on raw_frame topic)
+            #   .preview  -> NN input(s) for face detection (and future capabilities)
             self.camRgb = self.pipeline.createColorCamera()
             self.camRgb.setVideoSize(self.preview_width, self.preview_height)
+            self.camRgb.setPreviewSize(FACE_NN_INPUT_SIZE, FACE_NN_INPUT_SIZE)
+            # Stretch the 16:9 sensor frame into the 1:1 NN input. False ->
+            # consumers can recover pixel coords in the video frame by
+            # multiplying normalized bbox coords by (video_width, video_height).
+            self.camRgb.setPreviewKeepAspectRatio(False)
             self.camRgb.setInterleaved(False)
 
             # On-device MJPEG encoder. The OAK has a hardware codec; using it
-            # frees the Pi's CPU from cv2.imencode (~30% -> <5%).
+            # frees the Pi's CPU from cv2.imencode (~30% -> ~20%).
             self.video_encoder = self.pipeline.createVideoEncoder()
             self.video_encoder.setDefaultProfilePreset(
                 self.camRgb.getFps(),
@@ -135,10 +173,30 @@ class CameraNode(Node):
             xout_jpeg.setStreamName("jpeg")
             self.video_encoder.bitstream.link(xout_jpeg.input)
 
+            # Face detection NN. Always loaded per v1 design (§4.4); the host
+            # only reads the output queue when there are subscribers — see
+            # _check_lazy_subscribers() and timer_callback().
+            self.face_nn = self.pipeline.createMobileNetDetectionNetwork()
+            self.face_nn.setBlobPath(
+                blobconverter.from_zoo(
+                    name=FACE_NN_NAME, shaves=FACE_NN_SHAVES
+                )
+            )
+            self.face_nn.setConfidenceThreshold(FACE_NN_CONFIDENCE_THRESHOLD)
+            self.face_nn.input.setBlocking(False)
+            self.camRgb.preview.link(self.face_nn.input)
+
+            xout_face_nn = self.pipeline.createXLinkOut()
+            xout_face_nn.setStreamName("face_nn")
+            self.face_nn.out.link(xout_face_nn.input)
+
             # Try to connect to device.
             self.device = dai.Device(self.pipeline)
             self.queue = self.device.getOutputQueue(
                 name="jpeg", maxSize=4, blocking=False
+            )
+            self.face_nn_queue = self.device.getOutputQueue(
+                name="face_nn", maxSize=4, blocking=False
             )
             return True
 
@@ -146,6 +204,7 @@ class CameraNode(Node):
             self.get_logger().error(f"Camera not found: {e}")
             self.device = None
             self.queue = None
+            self.face_nn_queue = None
             return False
 
     def publish_camera_info(self):
@@ -236,6 +295,65 @@ class CameraNode(Node):
         b64_msg = String()
         b64_msg.data = jpg_b64
         self.raw_frame_b64_pub.publish(b64_msg)
+
+        # Lazy: face detections, gated by subscriber count. The NN itself
+        # keeps running on-device whether or not we read its output.
+        if self._face_publishing:
+            self._publish_face_detections(stamp)
+
+    def _publish_face_detections(self, stamp):
+        """Drain the NN output queue and publish a Detection2DArray.
+
+        Bbox coordinates from depthai are normalized [0..1] of the NN input
+        frame (which is the camera preview, stretched to 1:1). We publish in
+        pixel coordinates of the raw_frame (camRgb.video size) so consumers
+        can correlate detections with the published image.
+        """
+        nn_pkt = self.face_nn_queue.tryGet()
+        if nn_pkt is None:
+            return
+
+        msg = Detection2DArray()
+        msg.header.stamp = stamp
+        msg.header.frame_id = FRAME_ID
+
+        for det in nn_pkt.detections:
+            d = Detection2D()
+            d.header = msg.header
+            d.bbox.center.position.x = (
+                (det.xmin + det.xmax) / 2.0 * self.preview_width
+            )
+            d.bbox.center.position.y = (
+                (det.ymin + det.ymax) / 2.0 * self.preview_height
+            )
+            d.bbox.size_x = (det.xmax - det.xmin) * self.preview_width
+            d.bbox.size_y = (det.ymax - det.ymin) * self.preview_height
+
+            hyp = ObjectHypothesisWithPose()
+            hyp.hypothesis.class_id = FACE_CLASS_ID
+            hyp.hypothesis.score = float(det.confidence)
+            d.results.append(hyp)
+
+            msg.detections.append(d)
+
+        self.face_detections_pub.publish(msg)
+
+    def _check_lazy_subscribers(self):
+        """Toggle publishing flags for lazy capabilities based on whether
+        anyone is subscribed. Runs every SUBSCRIBER_POLL_PERIOD_S seconds.
+        """
+        face_subs = self.face_detections_pub.get_subscription_count()
+        if face_subs > 0 and not self._face_publishing:
+            self._face_publishing = True
+            self.get_logger().info(
+                f"Face detection consumers appeared ({face_subs}); "
+                "publishing /vision/face_detections"
+            )
+        elif face_subs == 0 and self._face_publishing:
+            self._face_publishing = False
+            self.get_logger().info(
+                "No face detection consumers; pausing /vision/face_detections"
+            )
 
     def timer_period_callback(self, msg):
         self.timer_period = msg.data
