@@ -222,7 +222,7 @@ Multi-PR effort. Order matters because each step depends on the previous:
      If neither trigger fires, defer the restructure to whichever future commit first hits one. The point is to let the structure be motivated by real duplication, not by speculation about what publishers might want in common.
 4. **Cerebra adjustment** — update the camera page topic name from `camera_topic` to `/vision/raw_frame_b64`.
 5. **Blockly generator refactor** — `face_detector_start_stop` and `face_detector_running` (in `pib-blockly`) emit ROS subscriber code instead of depthai pipeline. The `FaceDetector` class declaration in `function-declarations.ts` is removed.
-6. **Programs container slim-down** — remove the dependencies that user programs no longer need (none added, but document that cv2/depthai/blobconverter must NOT be added back for vision purposes).
+6. **Programs container vision deps** — add `ros-humble-vision-msgs` to `ros_packages/programs/Dockerfile` (apt) so user programs can `from vision_msgs.msg import Detection2DArray`. Do NOT add cv2 / depthai / blobconverter / numpy back: the architecture explicitly puts hardware ownership in `ros-vision`. The `ros-core` base image already provides `rclpy` and `std_msgs`; everything user programs subscribe to should travel through `vision_msgs` (or other standard ROS message packages).
 7. **Deprecation message** — old depthai-in-user-program path emits a clear error directing users to re-save their Blockly program (which then uses the new generators).
 
 Each step is a separate PR. Steps 1-3 land on `feat/vision-architecture`; once that's merged to main, steps 4-7 can land independently.
