@@ -4,4 +4,4 @@
 # they should be left blank/empty
 ImageId id
 ImageFormat format
-byte[] data
+uint8[] data
