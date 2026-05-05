@@ -54,33 +54,21 @@ SUBSCRIBER_POLL_PERIOD_S = 1.0
 
 class ErrorPublisher(Node):
 
-    # def __new__(cls, error_message):
-    #    print("creating new ErrorPublisher with Error message" + error_message)
-
     def __init__(self):
         super().__init__("error_publisher")
-        self.publisher_ = self.create_publisher(String, "camera_topic", 10)
-        timer_period = 1  # seconds
-        self.timer = self.create_timer(timer_period, self.timer_callback)
-        self.current_image = ""
+        self.publisher_ = self.create_publisher(String, "/vision/raw_frame_b64", 10)
+        self.timer = self.create_timer(1.0, self.timer_callback)
 
     def timer_callback(self):
         msg = String()
-        msg.data = "Camera not available: "
+        msg.data = "Camera not available"
         self.publisher_.publish(msg)
-        # self.get_logger().info('Publishing: "%s"' % msg.data)
 
 
 class CameraNode(Node):
 
     def __init__(self):
         super().__init__("camera_node")
-        # Legacy publisher — kept until Cerebra migrates to /vision/raw_frame_b64
-        # (step 4 of docs/vision-architecture.md migration plan).
-        self.legacy_camera_topic_pub = self.create_publisher(
-            String, "camera_topic", 10
-        )
-        # Always-on /vision/* topics (sub-step 3.2 of the migration plan).
         self.raw_frame_pub = self.create_publisher(
             CompressedImage, "/vision/raw_frame", 10
         )
@@ -119,13 +107,15 @@ class CameraNode(Node):
         # Initialize pipeline when camera is available
         self.camera_available = self.init_pipeline()
 
+        self.current_image = ""
+
         if self.camera_available:
             self.get_camera_image_service = self.create_service(
                 GetCameraImage, "get_camera_image", self.get_camera_image_callback
             )
             self.publish_camera_info()
             self.publish_static_transforms()
-            self.get_logger().info("Camera service initialized.")
+            self.get_logger().info("Camera node initialized.")
         else:
             self.get_logger().error("Camera not available.")
 
@@ -138,7 +128,6 @@ class CameraNode(Node):
         )
 
     def get_camera_image_callback(self, request, response):
-        self.get_logger().info(f"LEN IMAGE: {len(self.current_image)}")
         response.image_base64 = self.current_image
         return response
 
@@ -277,12 +266,6 @@ class CameraNode(Node):
 
         stamp = self.get_clock().now().to_msg()
 
-        # Legacy /camera_topic (Cerebra still consumes this). Remove after step 4.
-        legacy_msg = String()
-        legacy_msg.data = jpg_b64
-        self.current_image = legacy_msg.data
-        self.legacy_camera_topic_pub.publish(legacy_msg)
-
         # /vision/raw_frame (binary CompressedImage, ROS-native)
         compressed_msg = CompressedImage()
         compressed_msg.header.stamp = stamp
@@ -291,10 +274,11 @@ class CameraNode(Node):
         compressed_msg.data = jpg_bytes
         self.raw_frame_pub.publish(compressed_msg)
 
-        # /vision/raw_frame_b64 (String, for Cerebra rosbridge after step 4)
+        # /vision/raw_frame_b64 (String, for Cerebra via rosbridge)
         b64_msg = String()
         b64_msg.data = jpg_b64
         self.raw_frame_b64_pub.publish(b64_msg)
+        self.current_image = jpg_b64
 
         # Lazy: face detections, gated by subscriber count. The NN itself
         # keeps running on-device whether or not we read its output.
