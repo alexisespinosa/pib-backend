@@ -163,6 +163,9 @@ class OverlayData:
     rects: list  # list of (x, y, w, h, label) tuples
 
 
+MAX_OVERLAY_ITEMS = 10
+
+
 class GuiApplication(Frame):
 
     def __init__(
@@ -186,7 +189,6 @@ class GuiApplication(Frame):
         self.overlay_queue = overlay_queue
         self._current_overlay: OverlayData | None = None
 
-        # define a canvas where the main-image is displayed
         self.canvas = Canvas(
             self,
             width=self._width,
@@ -196,8 +198,21 @@ class GuiApplication(Frame):
         )
         self.canvas.place(x=0, y=0)
 
-        # the current static-image/animation that is shown is stored here
         self.current_main_content: PhotoImage | Animation | None = None
+        self._last_image_data: bytes | None = None
+
+        self._image_item = self.canvas.create_image(0, 0, anchor="nw")
+
+        self._overlay_pool: list[tuple[int, int]] = []
+        for _ in range(MAX_OVERLAY_ITEMS):
+            rect = self.canvas.create_rectangle(
+                0, 0, 0, 0, outline="#00ff00", width=2, state="hidden"
+            )
+            text = self.canvas.create_text(
+                0, 0, text="", fill="#00ff00", anchor="sw",
+                font=("sans", 12), state="hidden"
+            )
+            self._overlay_pool.append((rect, text))
 
         self._show_image(inital_image)
 
@@ -211,8 +226,9 @@ class GuiApplication(Frame):
         self.grid()
 
     def _show_image(self, raw_image: RawImage) -> None:
-        """update the main background image"""
-        self.canvas.delete("all")
+        if raw_image.data == self._last_image_data:
+            return
+        self._last_image_data = raw_image.data
         if isinstance(self.current_main_content, Animation):
             self.current_main_content.stop()
         if raw_image.format_value == ImageFormat.ANIMATED_GIF:
@@ -228,35 +244,39 @@ class GuiApplication(Frame):
     def _show_static_image(self, raw_image: RawImage) -> None:
         with PIL.Image.open(BytesIO(raw_image.data)) as image:
             resized = image.resize((self._width, self._height))
-        self.current_main_content = PIL.ImageTk.PhotoImage(resized)
-        self.canvas.create_image(0, 0, image=self.current_main_content, anchor="nw")
+        if isinstance(self.current_main_content, PIL.ImageTk.PhotoImage):
+            self.current_main_content.paste(resized)
+        else:
+            self.current_main_content = PIL.ImageTk.PhotoImage(resized)
+            self.canvas.itemconfig(self._image_item, image=self.current_main_content)
 
     def _show_next_frame(self, animation: Animation) -> None:
         try:
             frame: AnimationFrame = next(animation)
         except StopIteration:
             return
-        self.canvas.delete("all")
-        self.canvas.create_image(0, 0, image=frame.photo_image, anchor="nw")
+        self.canvas.itemconfig(self._image_item, image=frame.photo_image)
         self.canvas.after(frame.duration_ms, self._show_next_frame, animation)
 
     def _draw_overlay(self) -> None:
-        self.canvas.delete("overlay")
-        if self._current_overlay is None:
-            return
-        for (x, y, w, h, label) in self._current_overlay.rects:
-            x1 = int((x - w / 2) * self._width)
-            y1 = int((y - h / 2) * self._height)
-            x2 = int((x + w / 2) * self._width)
-            y2 = int((y + h / 2) * self._height)
-            self.canvas.create_rectangle(
-                x1, y1, x2, y2, outline="#00ff00", width=2, tags="overlay"
-            )
-            if label:
-                self.canvas.create_text(
-                    x1, y1 - 5, text=label, fill="#00ff00",
-                    anchor="sw", font=("sans", 12), tags="overlay"
+        rects = self._current_overlay.rects if self._current_overlay else []
+        for i, (rect_id, text_id) in enumerate(self._overlay_pool):
+            if i < len(rects):
+                x, y, w, h, label = rects[i]
+                x1 = int((x - w / 2) * self._width)
+                y1 = int((y - h / 2) * self._height)
+                x2 = int((x + w / 2) * self._width)
+                y2 = int((y + h / 2) * self._height)
+                self.canvas.coords(rect_id, x1, y1, x2, y2)
+                self.canvas.itemconfigure(rect_id, state="normal")
+                self.canvas.coords(text_id, x1, y1 - 5)
+                self.canvas.itemconfigure(
+                    text_id, text=label,
+                    state="normal" if label else "hidden",
                 )
+            else:
+                self.canvas.itemconfigure(rect_id, state="hidden")
+                self.canvas.itemconfigure(text_id, state="hidden")
 
     def _poll_next_image(self) -> None:
         if self.overlay_queue.qsize() != 0:
