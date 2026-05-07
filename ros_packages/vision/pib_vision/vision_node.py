@@ -45,6 +45,15 @@ FACE_NN_CONFIDENCE_THRESHOLD = 0.5
 # to share with other capabilities.
 FACE_CLASS_ID = "face"
 
+# --- Stereo depth capability ------------------------------------------------
+# Uses the OAK-D Lite's dedicated stereo depth engine (not SHAVE cores),
+# so it runs alongside the face NN without contention.
+DEPTH_MEDIAN_FILTER = dai.MedianFilter.KERNEL_7x7
+DEPTH_FRAME_ID = "oak_d_lite_depth"
+# Size of the ROI around the queried pixel (in normalized coordinates).
+# A small region averages out noise; 0.02 = ~2% of frame = ~13x14 pixels.
+DEPTH_ROI_HALF_SIZE = 0.01
+
 # Polling interval for subscriber-count gating of lazy capabilities.
 # Trade-off: longer interval = less idle CPU, longer activation latency.
 # 1s is fine for human-driven subscribe events (Cerebra page open, user
@@ -86,6 +95,15 @@ class CameraNode(Node):
             Detection2DArray, "/vision/face_detections", 10
         )
         self._face_publishing = False
+
+        self.depth_result_pub = self.create_publisher(
+            Int32, "/vision/depth_result", 10
+        )
+        self.depth_query_sub = self.create_subscription(
+            Int32MultiArray, "/vision/depth_query",
+            self._on_depth_query, 10,
+        )
+        self._depth_enabled = False
 
         self.tf_broadcaster = StaticTransformBroadcaster(self)
 
@@ -179,6 +197,50 @@ class CameraNode(Node):
             xout_face_nn.setStreamName("face_nn")
             self.face_nn.out.link(xout_face_nn.input)
 
+            # Stereo depth with on-device SpatialLocationCalculator.
+            # Only the queried depth value crosses USB (not the full frame).
+            mono_left = self.pipeline.createMonoCamera()
+            mono_left.setResolution(
+                dai.MonoCameraProperties.SensorResolution.THE_480_P
+            )
+            mono_left.setBoardSocket(dai.CameraBoardSocket.CAM_B)
+
+            mono_right = self.pipeline.createMonoCamera()
+            mono_right.setResolution(
+                dai.MonoCameraProperties.SensorResolution.THE_480_P
+            )
+            mono_right.setBoardSocket(dai.CameraBoardSocket.CAM_C)
+
+            stereo = self.pipeline.createStereoDepth()
+            stereo.setDefaultProfilePreset(
+                dai.node.StereoDepth.PresetMode.HIGH_DENSITY
+            )
+            stereo.initialConfig.setMedianFilter(DEPTH_MEDIAN_FILTER)
+            stereo.setLeftRightCheck(True)
+            stereo.setSubpixel(False)
+            stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)
+            mono_left.out.link(stereo.left)
+            mono_right.out.link(stereo.right)
+
+            spatial_calc = self.pipeline.createSpatialLocationCalculator()
+            spatial_calc.setWaitForConfigInput(False)
+            default_cfg = dai.SpatialLocationCalculatorConfigData()
+            default_cfg.roi = dai.Rect(
+                dai.Point2f(0.4, 0.4), dai.Point2f(0.6, 0.6)
+            )
+            default_cfg.depthThresholds.lowerThreshold = 200
+            default_cfg.depthThresholds.upperThreshold = 10000
+            spatial_calc.initialConfig.addROI(default_cfg)
+            stereo.depth.link(spatial_calc.inputDepth)
+
+            xin_spatial_cfg = self.pipeline.createXLinkIn()
+            xin_spatial_cfg.setStreamName("spatial_cfg")
+            xin_spatial_cfg.out.link(spatial_calc.inputConfig)
+
+            xout_spatial = self.pipeline.createXLinkOut()
+            xout_spatial.setStreamName("spatial_data")
+            spatial_calc.out.link(xout_spatial.input)
+
             # Try to connect to device.
             self.device = dai.Device(self.pipeline)
             self.queue = self.device.getOutputQueue(
@@ -187,6 +249,12 @@ class CameraNode(Node):
             self.face_nn_queue = self.device.getOutputQueue(
                 name="face_nn", maxSize=4, blocking=False
             )
+            self.spatial_cfg_queue = self.device.getInputQueue(
+                name="spatial_cfg"
+            )
+            self.spatial_data_queue = self.device.getOutputQueue(
+                name="spatial_data", maxSize=4, blocking=False
+            )
             return True
 
         except Exception as e:
@@ -194,6 +262,8 @@ class CameraNode(Node):
             self.device = None
             self.queue = None
             self.face_nn_queue = None
+            self.spatial_cfg_queue = None
+            self.spatial_data_queue = None
             return False
 
     def publish_camera_info(self):
@@ -249,9 +319,16 @@ class CameraNode(Node):
         t.child_frame_id = FRAME_ID
         # Identity: translation defaults to (0,0,0); set quaternion to (0,0,0,1).
         t.transform.rotation.w = 1.0
-        self.tf_broadcaster.sendTransform(t)
+        t_depth = TransformStamped()
+        t_depth.header.stamp = t.header.stamp
+        t_depth.header.frame_id = DEVICE_FRAME_ID
+        t_depth.child_frame_id = DEPTH_FRAME_ID
+        t_depth.transform.rotation.w = 1.0
+
+        self.tf_broadcaster.sendTransform([t, t_depth])
         self.get_logger().info(
-            f"Published static TF: {DEVICE_FRAME_ID} -> {FRAME_ID} (identity)"
+            f"Published static TF: {DEVICE_FRAME_ID} -> {FRAME_ID}, "
+            f"{DEVICE_FRAME_ID} -> {DEPTH_FRAME_ID} (identity)"
         )
 
     def timer_callback(self):
@@ -284,6 +361,9 @@ class CameraNode(Node):
         # keeps running on-device whether or not we read its output.
         if self._face_publishing:
             self._publish_face_detections(stamp)
+
+        if self._depth_enabled:
+            self._poll_depth_results()
 
     def _publish_face_detections(self, stamp):
         """Drain the NN output queue and publish a Detection2DArray.
@@ -322,6 +402,42 @@ class CameraNode(Node):
 
         self.face_detections_pub.publish(msg)
 
+    def _on_depth_query(self, msg):
+        if not self._depth_enabled or self.spatial_cfg_queue is None:
+            return
+        x, y = msg.data[0], msg.data[1]
+        nx = x / self.preview_width
+        ny = y / self.preview_height
+        cfg = dai.SpatialLocationCalculatorConfigData()
+        cfg.roi = dai.Rect(
+            dai.Point2f(
+                max(0.0, nx - DEPTH_ROI_HALF_SIZE),
+                max(0.0, ny - DEPTH_ROI_HALF_SIZE),
+            ),
+            dai.Point2f(
+                min(1.0, nx + DEPTH_ROI_HALF_SIZE),
+                min(1.0, ny + DEPTH_ROI_HALF_SIZE),
+            ),
+        )
+        cfg.depthThresholds.lowerThreshold = 200
+        cfg.depthThresholds.upperThreshold = 10000
+        spatial_cfg = dai.SpatialLocationCalculatorConfig()
+        spatial_cfg.addROI(cfg)
+        self.spatial_cfg_queue.send(spatial_cfg)
+
+    def _poll_depth_results(self):
+        result = self.spatial_data_queue.tryGet()
+        if result is None:
+            return
+        spatial_data = result.getSpatialLocations()
+        if not spatial_data:
+            return
+        loc = spatial_data[0]
+        depth_mm = int(loc.spatialCoordinates.z)
+        msg = Int32()
+        msg.data = depth_mm
+        self.depth_result_pub.publish(msg)
+
     def _check_lazy_subscribers(self):
         """Toggle publishing flags for lazy capabilities based on whether
         anyone is subscribed. Runs every SUBSCRIBER_POLL_PERIOD_S seconds.
@@ -337,6 +453,19 @@ class CameraNode(Node):
             self._face_publishing = False
             self.get_logger().info(
                 "No face detection consumers; pausing /vision/face_detections"
+            )
+
+        depth_subs = self.depth_result_pub.get_subscription_count()
+        if depth_subs > 0 and not self._depth_enabled:
+            self._depth_enabled = True
+            self.get_logger().info(
+                f"Depth consumers appeared ({depth_subs}); "
+                "depth queries enabled"
+            )
+        elif depth_subs == 0 and self._depth_enabled:
+            self._depth_enabled = False
+            self.get_logger().info(
+                "No depth consumers; depth queries disabled"
             )
 
     def timer_period_callback(self, msg):
