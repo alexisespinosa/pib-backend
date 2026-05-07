@@ -406,9 +406,6 @@ class CameraNode(Node):
         if not self._depth_enabled or self.spatial_cfg_queue is None:
             return
         x, y = msg.data[0], msg.data[1]
-        # Depth map is in mono camera frame (640x480), input coords
-        # are in RGB frame (preview_width x preview_height). Normalize
-        # using the depth frame dimensions.
         nx = x / self.preview_width
         ny = y / self.preview_height
         cfg = dai.SpatialLocationCalculatorConfigData()
