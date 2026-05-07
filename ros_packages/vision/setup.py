@@ -1,6 +1,6 @@
 from setuptools import setup
 
-package_name = "oak_d_lite"
+package_name = "pib_vision"
 
 setup(
     name=package_name,
@@ -18,6 +18,6 @@ setup(
     license="TODO: License declaration",
     tests_require=["pytest"],
     entry_points={
-        "console_scripts": ["stereo = oak_d_lite.stereo:main"],
+        "console_scripts": ["vision_node = pib_vision.vision_node:main"],
     },
 )

@@ -6,6 +6,8 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
     build-essential \
     python3-colcon-common-extensions \
     python3-colcon-mixin \
+    python3-opencv \
+    ros-humble-vision-msgs \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

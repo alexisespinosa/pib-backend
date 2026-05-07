@@ -12,10 +12,11 @@ from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 import PIL.Image
+import PIL.ImageTk
 
 from tkinter import *
 
-from datatypes.msg import DisplayImage, ImageFormat, ImageId
+from datatypes.msg import DisplayImage, DisplayOverlay, ImageFormat, ImageId
 
 import os
 
@@ -52,7 +53,7 @@ class RawImage:
         match image_id:
             case ImageId.CUSTOM:
                 return RawImage(
-                    display_image.format.value, b"".join(display_image.data)
+                    display_image.format.value, bytes(display_image.data)
                 )
             case ImageId.NONE:
                 return None
@@ -155,12 +156,23 @@ FORMAT_VALUE_TO_STR: dict[int, str] = {
 }
 
 
+@dataclass
+class OverlayData:
+    """Normalized [0..1] rectangles to draw on top of the display image."""
+
+    rects: list  # list of (x, y, w, h, label) tuples
+
+
+MAX_OVERLAY_ITEMS = 10
+
+
 class GuiApplication(Frame):
 
     def __init__(
         self,
         parent: Widget,
         image_queue: Queue[RawImage | None],
+        overlay_queue: Queue[OverlayData | None],
         inital_image: RawImage,
         *args,
         **kwargs,
@@ -174,8 +186,9 @@ class GuiApplication(Frame):
 
         # store the image_queue to poll from it for images to show
         self.image_queue = image_queue
+        self.overlay_queue = overlay_queue
+        self._current_overlay: OverlayData | None = None
 
-        # define a canvas where the main-image is displayed
         self.canvas = Canvas(
             self,
             width=self._width,
@@ -185,8 +198,21 @@ class GuiApplication(Frame):
         )
         self.canvas.place(x=0, y=0)
 
-        # the current static-image/animation that is shown is stored here
         self.current_main_content: PhotoImage | Animation | None = None
+        self._last_image_data: bytes | None = None
+
+        self._image_item = self.canvas.create_image(0, 0, anchor="nw")
+
+        self._overlay_pool: list[tuple[int, int]] = []
+        for _ in range(MAX_OVERLAY_ITEMS):
+            rect = self.canvas.create_rectangle(
+                0, 0, 0, 0, outline="#00ff00", width=2, state="hidden"
+            )
+            text = self.canvas.create_text(
+                0, 0, text="", fill="#00ff00", anchor="sw",
+                font=("sans", 12), state="hidden"
+            )
+            self._overlay_pool.append((rect, text))
 
         self._show_image(inital_image)
 
@@ -200,8 +226,9 @@ class GuiApplication(Frame):
         self.grid()
 
     def _show_image(self, raw_image: RawImage) -> None:
-        """update the main background image"""
-        self.canvas.delete("all")
+        if raw_image.data == self._last_image_data:
+            return
+        self._last_image_data = raw_image.data
         if isinstance(self.current_main_content, Animation):
             self.current_main_content.stop()
         if raw_image.format_value == ImageFormat.ANIMATED_GIF:
@@ -215,55 +242,80 @@ class GuiApplication(Frame):
         self._show_next_frame(animation)
 
     def _show_static_image(self, raw_image: RawImage) -> None:
-        format_str = FORMAT_VALUE_TO_STR[raw_image.format_value]
         with PIL.Image.open(BytesIO(raw_image.data)) as image:
             resized = image.resize((self._width, self._height))
-            # buffer for storing binary data of image
-            data_buffer = BytesIO()
-            # save the current frame in the data-buffer
-            resized.save(data_buffer, format_str)
-            data = base64.b64encode(data_buffer.getvalue())
-        self.current_main_content = PhotoImage(data=data, format=format_str)
-        self.canvas.create_image(0, 0, image=self.current_main_content, anchor="nw")
+        if isinstance(self.current_main_content, PIL.ImageTk.PhotoImage):
+            self.current_main_content.paste(resized)
+        else:
+            self.current_main_content = PIL.ImageTk.PhotoImage(resized)
+            self.canvas.itemconfig(self._image_item, image=self.current_main_content)
 
     def _show_next_frame(self, animation: Animation) -> None:
         try:
             frame: AnimationFrame = next(animation)
         except StopIteration:
             return
-        self.canvas.delete("all")
-        self.canvas.create_image(0, 0, image=frame.photo_image, anchor="nw")
+        self.canvas.itemconfig(self._image_item, image=frame.photo_image)
         self.canvas.after(frame.duration_ms, self._show_next_frame, animation)
 
+    def _draw_overlay(self) -> None:
+        rects = self._current_overlay.rects if self._current_overlay else []
+        for i, (rect_id, text_id) in enumerate(self._overlay_pool):
+            if i < len(rects):
+                x, y, w, h, label = rects[i]
+                x1 = int((x - w / 2) * self._width)
+                y1 = int((y - h / 2) * self._height)
+                x2 = int((x + w / 2) * self._width)
+                y2 = int((y + h / 2) * self._height)
+                self.canvas.coords(rect_id, x1, y1, x2, y2)
+                self.canvas.itemconfigure(rect_id, state="normal")
+                self.canvas.coords(text_id, x1, y1 - 5)
+                self.canvas.itemconfigure(
+                    text_id, text=label,
+                    state="normal" if label else "hidden",
+                )
+            else:
+                self.canvas.itemconfigure(rect_id, state="hidden")
+                self.canvas.itemconfigure(text_id, state="hidden")
+
     def _poll_next_image(self) -> None:
+        if self.overlay_queue.qsize() != 0:
+            while self.overlay_queue.qsize() != 0:
+                self._current_overlay = self.overlay_queue.get()
+            self._draw_overlay()
+
         if self.image_queue.qsize() != 0:
-            image: Optional[RawImage] = self.image_queue.get()
+            image: Optional[RawImage] = None
+            while self.image_queue.qsize() != 0:
+                image = self.image_queue.get()
             if image is None:
                 self.winfo_toplevel().destroy()
                 return
             else:
-                # if an image is received, reset the timeout to the lowest
-                # possible value
                 self.polling_timeout_ms = 10
                 self._show_image(image)
+                self._draw_overlay()
         else:
-            # if no image, was received, increase the polling timeout
-            # (value is capped at 160ms)
             self.polling_timeout_ms = min(2 * self.polling_timeout_ms, 160)
         self.after(self.polling_timeout_ms, self._poll_next_image)
 
 
+
 class DisplayNode(Node):
 
-    def __init__(self, image_queue: Queue[RawImage | None]) -> None:
+    def __init__(self, image_queue: Queue[RawImage | None], overlay_queue: Queue[OverlayData | None]) -> None:
 
         super().__init__("display")
 
         self.create_subscription(
             DisplayImage, "display_image", self.on_display_image_received, 1
         )
+        self.create_subscription(
+            DisplayOverlay, "display_overlay", self.on_display_overlay_received, 1
+        )
 
         self.image_queue = image_queue
+        self.overlay_queue = overlay_queue
 
         pib_eyes_animated = RawImage.from_image_file(
             IMAGE_ID_TO_STATIC_IMAGES[ImageId.PIB_EYES_ANIMATED]
@@ -280,8 +332,16 @@ class DisplayNode(Node):
         except Exception as e:
             self.get_logger().error(f"error while showing image from topic: {e}.")
 
+    def on_display_overlay_received(self, msg: DisplayOverlay):
+        """callback function for the 'display_overlay'-topic subscriber"""
+        rects = []
+        for i in range(len(msg.x)):
+            label = msg.labels[i] if i < len(msg.labels) else ""
+            rects.append((msg.x[i], msg.y[i], msg.width[i], msg.height[i], label))
+        self.overlay_queue.put(OverlayData(rects=rects))
 
-def run_gui_application(image_queue: Queue[RawImage | None]) -> None:
+
+def run_gui_application(image_queue: Queue[RawImage | None], overlay_queue: Queue[OverlayData | None]) -> None:
     while True:
         image = image_queue.get()
         if image is None:
@@ -291,14 +351,14 @@ def run_gui_application(image_queue: Queue[RawImage | None]) -> None:
         root.attributes("-fullscreen", True)
         width = root.winfo_screenwidth()
         height = root.winfo_screenheight()
-        GuiApplication(root, image_queue, image, width=width, height=height)
+        GuiApplication(root, image_queue, overlay_queue, image, width=width, height=height)
         root.mainloop()
 
 
-def run_display_node(image_queue: Queue[RawImage | None]) -> None:
+def run_display_node(image_queue: Queue[RawImage | None], overlay_queue: Queue[OverlayData | None]) -> None:
     rclpy.init()
     executor = SingleThreadedExecutor()
-    display_node = DisplayNode(image_queue)
+    display_node = DisplayNode(image_queue, overlay_queue)
     executor.add_node(display_node)
     executor.spin()
     display_node.destroy_node()
@@ -306,15 +366,10 @@ def run_display_node(image_queue: Queue[RawImage | None]) -> None:
 
 
 def main(args=None) -> None:
-    # the image-queue is used to send images from the ros-node to the
-    # gui-application. The value is either a 'RawImage', which
-    # the ros-node requests do be shown, or alternatively 'None', in
-    # order to indicate that nothing should be shown (i.e. the gui-window
-    # is closed)
     image_queue: Queue[RawImage | None] = Queue(maxsize=1)
-    # run hui-application and ros in two separate threads
-    Thread(daemon=True, target=run_display_node, args=(image_queue,)).start()
-    run_gui_application(image_queue)
+    overlay_queue: Queue[OverlayData | None] = Queue(maxsize=1)
+    Thread(daemon=True, target=run_display_node, args=(image_queue, overlay_queue)).start()
+    run_gui_application(image_queue, overlay_queue)
 
 
 if __name__ == "__main__":

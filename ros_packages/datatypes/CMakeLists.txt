@@ -25,6 +25,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 	"msg/ImageId.msg"
 	"msg/ImageFormat.msg"
 	"msg/DisplayImage.msg"
+	"msg/DisplayOverlay.msg"
 	"srv/PlayAudioFromFile.srv"
 	"srv/PlayAudioFromSpeech.srv"
 	"srv/GetVoiceAssistantState.srv"
