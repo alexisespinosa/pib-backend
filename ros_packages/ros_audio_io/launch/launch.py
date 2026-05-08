@@ -20,19 +20,18 @@ def generate_launch_description():
         )
     )
 
-    # Only do DOA if user asked for the Respeaker
     if mic == "respeaker":
         ld.add_action(
             Node(
                 package="ros_audio_io",
-                executable="doa_publisher",
-                name="doa_publisher",
+                executable="hearing",
+                name="hearing_node",
                 output="screen",
             )
         )
     else:
         ld.add_action(
-            LogInfo(msg=f"[launch] MIC_DEVICE={mic!r}, skipping doa_publisher")
+            LogInfo(msg=f"[launch] MIC_DEVICE={mic!r}, skipping hearing_node")
         )
 
     return ld

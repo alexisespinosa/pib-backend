@@ -24,7 +24,7 @@ setup(
     entry_points={
         "console_scripts": [
             "audio_streamer = ros_audio_io.audio_streamer:main",
-            "doa_publisher = ros_audio_io.doa_publisher:main",
+            "hearing = ros_audio_io.hearing_node:main",
         ],
     },
 )
