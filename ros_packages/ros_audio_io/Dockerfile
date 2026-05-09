@@ -22,7 +22,16 @@ RUN apt-get update --fix-missing && \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python audio packages
-RUN pip install pyaudio numpy scipy taskgroup
+RUN pip install pyaudio numpy scipy taskgroup vosk
+
+# Download Vosk English model
+RUN apt-get update && apt-get install --no-install-recommends -y unzip \
+    && curl -L https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip -o /tmp/model.zip \
+    && unzip /tmp/model.zip -d /app \
+    && mv /app/vosk-model-small-en-us-0.15 /app/vosk-model \
+    && rm /tmp/model.zip \
+    && apt-get purge -y unzip && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY ./pib_api/client ./client
 RUN pip install ./client
