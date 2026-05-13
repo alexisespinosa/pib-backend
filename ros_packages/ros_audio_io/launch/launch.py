@@ -34,4 +34,13 @@ def generate_launch_description():
             LogInfo(msg=f"[launch] MIC_DEVICE={mic!r}, skipping hearing_node")
         )
 
+    ld.add_action(
+        Node(
+            package="ros_audio_io",
+            executable="stt",
+            name="stt_node",
+            output="screen",
+        )
+    )
+
     return ld

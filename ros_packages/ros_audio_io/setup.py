@@ -25,6 +25,7 @@ setup(
         "console_scripts": [
             "audio_streamer = ros_audio_io.audio_streamer:main",
             "hearing = ros_audio_io.hearing_node:main",
+            "stt = ros_audio_io.stt_node:main",
         ],
     },
 )
