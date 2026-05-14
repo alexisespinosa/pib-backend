@@ -43,4 +43,13 @@ def generate_launch_description():
         )
     )
 
+    ld.add_action(
+        Node(
+            package="ros_audio_io",
+            executable="tts",
+            name="tts_node",
+            output="screen",
+        )
+    )
+
     return ld

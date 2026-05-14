@@ -22,7 +22,7 @@ RUN apt-get update --fix-missing && \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python audio packages
-RUN pip install pyaudio numpy scipy taskgroup vosk
+RUN pip install pyaudio numpy scipy taskgroup vosk piper-tts
 
 # Download Vosk English model
 RUN apt-get update && apt-get install --no-install-recommends -y unzip \
@@ -32,6 +32,13 @@ RUN apt-get update && apt-get install --no-install-recommends -y unzip \
     && rm /tmp/model.zip \
     && apt-get purge -y unzip && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
+
+# Download Piper TTS voice model (en_US-lessac-medium, ~75MB)
+RUN mkdir -p /app/piper-voice && \
+    curl -L https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx \
+      -o /app/piper-voice/model.onnx && \
+    curl -L https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json \
+      -o /app/piper-voice/model.onnx.json
 
 COPY ./pib_api/client ./client
 RUN pip install ./client

@@ -26,6 +26,7 @@ setup(
             "audio_streamer = ros_audio_io.audio_streamer:main",
             "hearing = ros_audio_io.hearing_node:main",
             "stt = ros_audio_io.stt_node:main",
+            "tts = ros_audio_io.tts_node:main",
         ],
     },
 )
