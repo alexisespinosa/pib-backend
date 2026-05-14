@@ -38,14 +38,19 @@ class TtsNode(Node):
         while True:
             text = self._queue.get()
             try:
-                rate = self.voice.config.sample_rate
-                stream = pya.open(
-                    format=pyaudio.paInt16, channels=1, rate=rate, output=True
-                )
-                for chunk in self.voice.synthesize_stream_raw(text):
-                    stream.write(chunk)
-                stream.stop_stream()
-                stream.close()
+                stream = None
+                for chunk in self.voice.synthesize(text):
+                    if stream is None:
+                        stream = pya.open(
+                            format=pyaudio.paInt16,
+                            channels=chunk.sample_channels,
+                            rate=chunk.sample_rate,
+                            output=True,
+                        )
+                    stream.write(chunk.audio_int16_bytes)
+                if stream is not None:
+                    stream.stop_stream()
+                    stream.close()
             except Exception as e:
                 self.get_logger().error(f"TTS playback failed: {e}")
 
