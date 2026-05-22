@@ -9,5 +9,12 @@ def generate_launch_description():
             Node(package="motors", executable="motor_control"),
             Node(package="motors", executable="motor_current"),
             Node(package="motors", executable="relay_control"),
+            Node(
+                package="motors",
+                executable="button_control",
+                parameters=[{
+                    "button_f_program": "TestVisual",
+                }],
+            ),
         ]
     )
