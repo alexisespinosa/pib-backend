@@ -6,15 +6,10 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
     build-essential \
     python3-colcon-common-extensions \
     python3-colcon-mixin \
-    python3-tk \
+    python3-pygame \
     && rm -rf /var/lib/apt/lists/*
-    
-WORKDIR /app
 
-RUN apt-get update --fix-missing && \
-    apt-get install --no-install-recommends -y python3-pip && \
-    pip install requests==2.32.3 && \
-    pip install pillow
+WORKDIR /app
 
 COPY ./ros_packages/datatypes ros2_ws/datatypes
 COPY ./ros_packages/display ros2_ws/display

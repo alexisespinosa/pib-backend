@@ -1,375 +1,237 @@
-from queue import Queue
-import base64
+import os
+import sys
 from dataclasses import dataclass
 from io import BytesIO
-from itertools import cycle
-import os
+from queue import Queue, Empty
 from threading import Thread
-from typing import Iterable, Iterator, Optional
+
+import pygame
 
 import rclpy
-from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
-import PIL.Image
-import PIL.ImageTk
+from std_msgs.msg import String
 
-from tkinter import *
+from datatypes.msg import DisplayImage, DisplayOverlay, ImageFormat, ImageId, ProxyRunProgramStatus
 
-from datatypes.msg import DisplayImage, DisplayOverlay, ImageFormat, ImageId
-
-import os
+from display.face import FaceRenderer, SCREEN_W, SCREEN_H
 
 os.environ.setdefault("DISPLAY", ":0.0")
+os.environ.setdefault("SDL_VIDEODRIVER", "x11")
 
-
-# points to the directory, where all static images are
-# stored that are managed by the display-node
 STATIC_IMAGE_DIR: str = os.getenv(
     "STATIC_IMAGE_DIR",
     "/home/pib/ros_working_dir/src/display/static_images",
 )
 
+FPS = 30
+
+
+# ── Data types for queue messages ───────────────────────────────────
 
 @dataclass
-class ImageFile:
-    """represents an image stored in the filesystem"""
-
-    format_value: bytes
-    filepath: str
-
-
-@dataclass
-class RawImage:
-    """an image whose data was loaded into main-memory"""
-
-    format_value: bytes
+class CameraFrame:
+    """A camera image (JPEG/PNG bytes) to display."""
     data: bytes
-
-    @staticmethod
-    def from_display_image(display_image: DisplayImage):
-        """turns a DisplayImage into a RawImage"""
-        image_id = display_image.id.value
-        match image_id:
-            case ImageId.CUSTOM:
-                return RawImage(
-                    display_image.format.value, bytes(display_image.data)
-                )
-            case ImageId.NONE:
-                return None
-            case _:
-                image_file = IMAGE_ID_TO_STATIC_IMAGES.get(image_id)
-                if image_file is None:
-                    raise Exception(f"illegal image-id: '{image_id}'.")
-                return RawImage.from_image_file(image_file)
-
-    @staticmethod
-    def from_image_file(image_file: ImageFile):
-        """turns a ImageFile into a RawImage"""
-        with open(image_file.filepath, "rb") as file:
-            data = file.read()
-        return RawImage(image_file.format_value, data)
-
-
-@dataclass
-class AnimationFrame:
-    """represents one frame of an animated gif"""
-
-    duration_ms: int
-    photo_image: PhotoImage
-
-
-class Animation:
-    """can be used to iterate over the frames of an animated gif"""
-
-    def __init__(self, data: bytes, width: int, height: int):
-        """initalizes the animation, with the given image-data"""
-        self._frames: Iterable[AnimationFrame] = self._as_frames(data, width, height)
-        self._frame_iterator = iter(cycle(self._frames))
-        self._stopped = False
-
-    def stop(self) -> None:
-        """stop the iterator"""
-        self._stopped = True
-
-    def __iter__(self) -> Iterator[AnimationFrame]:
-        return self
-
-    def __next__(self) -> AnimationFrame:
-        if self._stopped:
-            raise StopIteration()
-        else:
-            return next(self._frame_iterator)
-
-    def _as_frames(
-        self, data: bytes, width: int, height: int
-    ) -> Iterable[AnimationFrame]:
-        queue = Queue()
-        Thread(
-            target=self._load_frames_into_queue, args=(queue, data, width, height)
-        ).start()
-        while True:
-            data, duration_ms = queue.get()
-            if data is None:
-                break
-            yield AnimationFrame(duration_ms, PhotoImage(data=data))
-
-    def _load_frames_into_queue(
-        self, queue: Queue, data: bytes, width: int, height: int
-    ) -> None:
-        with PIL.Image.open(BytesIO(data)) as image:
-            # iterate over frames of image
-            for i in range(image.n_frames):
-                # go to i-th frame of the image
-                image.seek(i)
-                # resize the current frame, to fit the screen-size
-                resized = (
-                    image.resize((width, height))
-                    if image.width != width or image.height != height
-                    else image
-                )
-                # buffer for storing binary data of image-frames
-                data_buffer = BytesIO()
-                # save the current frame in the data-buffer
-                resized.save(data_buffer, "gif")
-                # extract data from buffer and encode bytes as base64
-                data = base64.b64encode(data_buffer.getvalue())
-                # get the duration of the current frame
-                duration_ms = image.info["duration"]
-                # yield the extracted data
-                queue.put((data, duration_ms))
-            # 'None' -> all frames were processed
-            queue.put((None, -1))
-
-
-# maps an image-id to its corresponding image in the filesystem
-IMAGE_ID_TO_STATIC_IMAGES: dict[int, ImageFile] = {
-    ImageId.PIB_EYES_ANIMATED: ImageFile(
-        ImageFormat.ANIMATED_GIF, STATIC_IMAGE_DIR + "/pib-eyes-animated.gif"
-    ),
-}
-
-FORMAT_VALUE_TO_STR: dict[int, str] = {
-    ImageFormat.ANIMATED_GIF: "gif",
-    ImageFormat.PNG: "png",
-    ImageFormat.JPEG: "jpeg",
-}
+    format_value: int
 
 
 @dataclass
 class OverlayData:
-    """Normalized [0..1] rectangles to draw on top of the display image."""
+    rects: list  # [(x, y, w, h, label), ...]
 
-    rects: list  # list of (x, y, w, h, label) tuples
 
+@dataclass
+class EmotionCommand:
+    name: str
+
+
+# ── Display node (ROS) ──────────────────────────────────────────────
 
 MAX_OVERLAY_ITEMS = 10
 
 
-class GuiApplication(Frame):
-
-    def __init__(
-        self,
-        parent: Widget,
-        image_queue: Queue[RawImage | None],
-        overlay_queue: Queue[OverlayData | None],
-        inital_image: RawImage,
-        *args,
-        **kwargs,
-    ):
-
-        self._width = kwargs.setdefault("width", 100)
-        self._height = kwargs.setdefault("height", 100)
-
-        # call to the constructor of the superclass
-        Frame.__init__(self, parent, *args, **kwargs)
-
-        # store the image_queue to poll from it for images to show
-        self.image_queue = image_queue
-        self.overlay_queue = overlay_queue
-        self._current_overlay: OverlayData | None = None
-
-        self.canvas = Canvas(
-            self,
-            width=self._width,
-            height=self._height,
-            borderwidth=0,
-            highlightthickness=0,
-        )
-        self.canvas.place(x=0, y=0)
-
-        self.current_main_content: PhotoImage | Animation | None = None
-        self._last_image_data: bytes | None = None
-
-        self._image_item = self.canvas.create_image(0, 0, anchor="nw")
-
-        self._overlay_pool: list[tuple[int, int]] = []
-        for _ in range(MAX_OVERLAY_ITEMS):
-            rect = self.canvas.create_rectangle(
-                0, 0, 0, 0, outline="#00ff00", width=2, state="hidden"
-            )
-            text = self.canvas.create_text(
-                0, 0, text="", fill="#00ff00", anchor="sw",
-                font=("sans", 12), state="hidden"
-            )
-            self._overlay_pool.append((rect, text))
-
-        self._show_image(inital_image)
-
-        # time until attempt to poll next image (in milliseconds)
-        self.polling_timeout_ms = 10
-
-        # intiate periodically polling for images in the queue
-        self._poll_next_image()
-
-        # position the widget in its parent
-        self.grid()
-
-    def _show_image(self, raw_image: RawImage) -> None:
-        if raw_image.data == self._last_image_data:
-            return
-        self._last_image_data = raw_image.data
-        if isinstance(self.current_main_content, Animation):
-            self.current_main_content.stop()
-        if raw_image.format_value == ImageFormat.ANIMATED_GIF:
-            self._show_animated_gif(raw_image)
-        else:
-            self._show_static_image(raw_image)
-
-    def _show_animated_gif(self, raw_image: RawImage) -> None:
-        animation = Animation(raw_image.data, self._width, self._height)
-        self.current_main_content = animation
-        self._show_next_frame(animation)
-
-    def _show_static_image(self, raw_image: RawImage) -> None:
-        with PIL.Image.open(BytesIO(raw_image.data)) as image:
-            resized = image.resize((self._width, self._height))
-        if isinstance(self.current_main_content, PIL.ImageTk.PhotoImage):
-            self.current_main_content.paste(resized)
-        else:
-            self.current_main_content = PIL.ImageTk.PhotoImage(resized)
-            self.canvas.itemconfig(self._image_item, image=self.current_main_content)
-
-    def _show_next_frame(self, animation: Animation) -> None:
-        try:
-            frame: AnimationFrame = next(animation)
-        except StopIteration:
-            return
-        self.canvas.itemconfig(self._image_item, image=frame.photo_image)
-        self.canvas.after(frame.duration_ms, self._show_next_frame, animation)
-
-    def _draw_overlay(self) -> None:
-        rects = self._current_overlay.rects if self._current_overlay else []
-        for i, (rect_id, text_id) in enumerate(self._overlay_pool):
-            if i < len(rects):
-                x, y, w, h, label = rects[i]
-                x1 = int((x - w / 2) * self._width)
-                y1 = int((y - h / 2) * self._height)
-                x2 = int((x + w / 2) * self._width)
-                y2 = int((y + h / 2) * self._height)
-                self.canvas.coords(rect_id, x1, y1, x2, y2)
-                self.canvas.itemconfigure(rect_id, state="normal")
-                self.canvas.coords(text_id, x1, y1 - 5)
-                self.canvas.itemconfigure(
-                    text_id, text=label,
-                    state="normal" if label else "hidden",
-                )
-            else:
-                self.canvas.itemconfigure(rect_id, state="hidden")
-                self.canvas.itemconfigure(text_id, state="hidden")
-
-    def _poll_next_image(self) -> None:
-        if self.overlay_queue.qsize() != 0:
-            while self.overlay_queue.qsize() != 0:
-                self._current_overlay = self.overlay_queue.get()
-            self._draw_overlay()
-
-        if self.image_queue.qsize() != 0:
-            image: Optional[RawImage] = None
-            while self.image_queue.qsize() != 0:
-                image = self.image_queue.get()
-            if image is None:
-                self.winfo_toplevel().destroy()
-                return
-            else:
-                self.polling_timeout_ms = 10
-                self._show_image(image)
-                self._draw_overlay()
-        else:
-            self.polling_timeout_ms = min(2 * self.polling_timeout_ms, 160)
-        self.after(self.polling_timeout_ms, self._poll_next_image)
-
-
-
 class DisplayNode(Node):
 
-    def __init__(self, image_queue: Queue[RawImage | None], overlay_queue: Queue[OverlayData | None]) -> None:
+    _PROGRAM_ACCEPTED = 1
+    _PROGRAM_EXECUTING = 2
+    _PROGRAM_SUCCEEDED = 4
+    _PROGRAM_CANCELED = 5
+    _PROGRAM_ABORTED = 6
 
+    def __init__(self, command_queue: Queue):
         super().__init__("display")
+        self._queue = command_queue
+        self._program_running = False
 
         self.create_subscription(
-            DisplayImage, "display_image", self.on_display_image_received, 1
+            DisplayImage, "display_image", self._on_display_image, 1
         )
         self.create_subscription(
-            DisplayOverlay, "display_overlay", self.on_display_overlay_received, 1
+            DisplayOverlay, "display_overlay", self._on_display_overlay, 1
+        )
+        self.create_subscription(
+            String, "display_emotion", self._on_emotion, 1
+        )
+        self.create_subscription(
+            ProxyRunProgramStatus, "proxy_run_program_status",
+            self._on_program_status, 1
         )
 
-        self.image_queue = image_queue
-        self.overlay_queue = overlay_queue
+        self._queue.put(EmotionCommand("sleeping"))
+        self.get_logger().info("Display node ready (pygame face renderer)")
 
-        pib_eyes_animated = RawImage.from_image_file(
-            IMAGE_ID_TO_STATIC_IMAGES[ImageId.PIB_EYES_ANIMATED]
-        )
-        self.image_queue.put(pib_eyes_animated)
+    def _on_display_image(self, msg: DisplayImage):
+        image_id = msg.id.value
+        if image_id == ImageId.NONE:
+            self._queue.put(EmotionCommand("sleeping"))
+            return
+        if image_id == ImageId.PIB_EYES_ANIMATED:
+            self._queue.put(EmotionCommand("sleeping"))
+            return
 
-        self.get_logger().info("Now Running DISPLAY")
+        if image_id == ImageId.CUSTOM:
+            data = bytes(msg.data)
+        else:
+            filepath = _IMAGE_ID_TO_PATH.get(image_id)
+            if filepath and os.path.isfile(filepath):
+                with open(filepath, "rb") as f:
+                    data = f.read()
+            else:
+                self.get_logger().warn(f"Unknown image id: {image_id}")
+                return
 
-    def on_display_image_received(self, display_image: DisplayImage):
-        """callback function for the 'display_image'-topic subscriber"""
-        try:
-            raw_image = RawImage.from_display_image(display_image)
-            self.image_queue.put(raw_image)
-        except Exception as e:
-            self.get_logger().error(f"error while showing image from topic: {e}.")
+        self._queue.put(CameraFrame(data=data, format_value=msg.format.value))
 
-    def on_display_overlay_received(self, msg: DisplayOverlay):
-        """callback function for the 'display_overlay'-topic subscriber"""
+    def _on_display_overlay(self, msg: DisplayOverlay):
         rects = []
         for i in range(len(msg.x)):
             label = msg.labels[i] if i < len(msg.labels) else ""
             rects.append((msg.x[i], msg.y[i], msg.width[i], msg.height[i], label))
-        self.overlay_queue.put(OverlayData(rects=rects))
+        self._queue.put(OverlayData(rects=rects))
+
+    def _on_emotion(self, msg: String):
+        self._queue.put(EmotionCommand(msg.data.strip().lower()))
+
+    def _on_program_status(self, msg: ProxyRunProgramStatus):
+        status = msg.status
+        if status in (self._PROGRAM_ACCEPTED, self._PROGRAM_EXECUTING):
+            if not self._program_running:
+                self._program_running = True
+                self._queue.put(EmotionCommand("neutral"))
+        elif status in (self._PROGRAM_SUCCEEDED, self._PROGRAM_ABORTED, self._PROGRAM_CANCELED):
+            if self._program_running:
+                self._program_running = False
+                self._queue.put(EmotionCommand("sleeping"))
 
 
-def run_gui_application(image_queue: Queue[RawImage | None], overlay_queue: Queue[OverlayData | None]) -> None:
-    while True:
-        image = image_queue.get()
-        if image is None:
-            continue
-        root = Tk()
-        root.bind("<Escape>", lambda _: root.destroy())
-        root.attributes("-fullscreen", True)
-        width = root.winfo_screenwidth()
-        height = root.winfo_screenheight()
-        GuiApplication(root, image_queue, overlay_queue, image, width=width, height=height)
-        root.mainloop()
+_IMAGE_ID_TO_PATH: dict[int, str] = {
+    ImageId.PIB_EYES_ANIMATED: os.path.join(STATIC_IMAGE_DIR, "pib-eyes-animated.gif"),
+}
 
 
-def run_display_node(image_queue: Queue[RawImage | None], overlay_queue: Queue[OverlayData | None]) -> None:
+# ── Pygame display loop ────────────────────────────────────────────
+
+def _load_camera_frame(frame: CameraFrame) -> pygame.Surface | None:
+    try:
+        buf = BytesIO(frame.data)
+        img = pygame.image.load(buf)
+        return pygame.transform.scale(img, (SCREEN_W, SCREEN_H))
+    except Exception:
+        return None
+
+
+def _draw_overlays(surface: pygame.Surface, overlay: OverlayData):
+    font = pygame.font.SysFont("sans", 16)
+    for x, y, w, h, label in overlay.rects:
+        x1 = int((x - w / 2) * SCREEN_W)
+        y1 = int((y - h / 2) * SCREEN_H)
+        x2 = int((x + w / 2) * SCREEN_W)
+        y2 = int((y + h / 2) * SCREEN_H)
+        rect = pygame.Rect(x1, y1, x2 - x1, y2 - y1)
+        pygame.draw.rect(surface, (0, 255, 0), rect, 2)
+        if label:
+            text = font.render(label, True, (0, 255, 0))
+            surface.blit(text, (x1, y1 - 18))
+
+
+def run_display(command_queue: Queue):
+    pygame.init()
+    pygame.font.init()
+    pygame.mouse.set_visible(False)
+
+    screen = pygame.display.set_mode((SCREEN_W, SCREEN_H), pygame.FULLSCREEN | pygame.NOFRAME)
+    pygame.display.set_caption("pib")
+    clock = pygame.time.Clock()
+
+    face = FaceRenderer()
+
+    # Display mode: "face" or "camera"
+    mode = "face"
+    camera_surface: pygame.Surface | None = None
+    current_overlay: OverlayData | None = None
+
+    running = True
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                running = False
+
+        # Drain command queue
+        while True:
+            try:
+                cmd = command_queue.get_nowait()
+            except Empty:
+                break
+
+            if isinstance(cmd, EmotionCommand):
+                mode = "face"
+                face.set_emotion(cmd.name)
+                current_overlay = None
+            elif isinstance(cmd, CameraFrame):
+                surf = _load_camera_frame(cmd)
+                if surf:
+                    camera_surface = surf
+                    mode = "camera"
+            elif isinstance(cmd, OverlayData):
+                current_overlay = cmd
+
+        # Render
+        if mode == "face":
+            face.draw(screen)
+        elif mode == "camera" and camera_surface is not None:
+            screen.blit(camera_surface, (0, 0))
+            if current_overlay:
+                _draw_overlays(screen, current_overlay)
+
+        pygame.display.flip()
+        clock.tick(FPS)
+
+    pygame.quit()
+
+
+# ── ROS thread ──────────────────────────────────────────────────────
+
+def run_ros_node(command_queue: Queue):
     rclpy.init()
     executor = SingleThreadedExecutor()
-    display_node = DisplayNode(image_queue, overlay_queue)
-    executor.add_node(display_node)
-    executor.spin()
-    display_node.destroy_node()
-    rclpy.shutdown()
+    node = DisplayNode(command_queue)
+    executor.add_node(node)
+    try:
+        executor.spin()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
-def main(args=None) -> None:
-    image_queue: Queue[RawImage | None] = Queue(maxsize=1)
-    overlay_queue: Queue[OverlayData | None] = Queue(maxsize=1)
-    Thread(daemon=True, target=run_display_node, args=(image_queue, overlay_queue)).start()
-    run_gui_application(image_queue, overlay_queue)
+# ── Main ────────────────────────────────────────────────────────────
+
+def main(args=None):
+    command_queue: Queue = Queue(maxsize=0)
+    Thread(daemon=True, target=run_ros_node, args=(command_queue,)).start()
+    run_display(command_queue)
 
 
 if __name__ == "__main__":
