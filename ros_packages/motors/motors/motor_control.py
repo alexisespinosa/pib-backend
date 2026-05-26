@@ -141,11 +141,11 @@ class MotorControl(Node):
         try:
             for motor_name, position in as_motor_positions(jt):
                 for motor in name_to_motors[motor_name]:
-                    self.get_logger().info(
+                    self.get_logger().debug(
                         f"setting position of {motor.name} to {position}"
                     )
                     successful = motor.set_position(position)
-                    self.get_logger().info(
+                    self.get_logger().debug(
                         f"setting position {'succeeded' if successful else 'failed'}."
                     )
                     response.successful &= successful

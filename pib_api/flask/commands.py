@@ -10,6 +10,7 @@ from model.camera_settings_model import CameraSettings
 from model.chat_message_model import ChatMessage
 from model.chat_model import Chat
 from model.motor_model import Motor
+from model.person_model import Person, FaceEmbedding
 from model.personality_model import Personality
 from model.program_model import Program
 from model.pose_model import Pose

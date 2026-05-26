@@ -47,6 +47,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 	"action/Chat.action"
 	"srv/GetMicConfiguration.srv"
 	"srv/CreateOrUpdateChatMessage.srv"
+	"srv/EnrollFace.srv"
 	DEPENDENCIES trajectory_msgs
 )
 

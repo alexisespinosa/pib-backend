@@ -18,6 +18,7 @@ RUN pip install blobconverter==1.4.2
 # source-only changes don't invalidate this layer.
 # See docs/vision-architecture.md §4.5.
 RUN python3 -c "import blobconverter; blobconverter.from_zoo(name='face-detection-retail-0004', shaves=6)"
+RUN python3 -c "import blobconverter; blobconverter.from_zoo(name='face-recognition-arcface-112x112', zoo_type='depthai', shaves=6)"
 
 COPY ./vision ros2_ws/vision
 

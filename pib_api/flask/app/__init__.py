@@ -5,6 +5,7 @@ from controller import (
     camera_controller,
     chat_controller,
     motor_controller,
+    person_controller,
     personality_controller,
     program_controller,
     pose_controller,
@@ -30,3 +31,4 @@ app.register_blueprint(
 )
 app.register_blueprint(pose_controller.bp, url_prefix="/pose", name="pose")
 app.register_blueprint(ip_controller.bp, url_prefix="/host-ip", name="host-ip")
+app.register_blueprint(person_controller.bp, url_prefix="/person", name="person")

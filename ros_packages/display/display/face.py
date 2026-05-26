@@ -101,6 +101,11 @@ EMOTIONS: dict[str, EmotionState] = {
         right_eye=EyeParams(_RE_CX, _EYE_CY + 0.05, _EYE_RX, _EYE_RY, openness=0.0),
         extra=ExtraAnimation(kind="sleeping_zzz"),
     ),
+    "curious": EmotionState(
+        left_eye=EyeParams(_LE_CX, _EYE_CY - 0.01, _EYE_RX * 1.05, _EYE_RY * 1.15),
+        right_eye=EyeParams(_RE_CX, _EYE_CY - 0.02, _EYE_RX * 1.12, _EYE_RY * 1.22),
+        mouth=MouthParams(0.5, 0.87, 0.06, 0.0, openness=0.05, visible=True),
+    ),
     "thinking": EmotionState(
         left_eye=EyeParams(_LE_CX + 0.03, _EYE_CY - 0.02, _EYE_RX * 0.9, _EYE_RY * 0.8, squint_bottom=0.15),
         right_eye=EyeParams(_RE_CX + 0.03, _EYE_CY - 0.04, _EYE_RX * 1.05, _EYE_RY * 0.9),

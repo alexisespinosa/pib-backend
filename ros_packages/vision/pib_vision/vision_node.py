@@ -1,12 +1,15 @@
 #!/usr/bin/python3
 import base64
+import json
 import time
 
 import blobconverter
 import depthai as dai
+import numpy as np
 import rclpy
-from datatypes.srv import GetCameraImage
+from datatypes.srv import EnrollFace, GetCameraImage
 from geometry_msgs.msg import TransformStamped
+from pib_api_client import person_client
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
 from sensor_msgs.msg import CameraInfo, CompressedImage
@@ -14,51 +17,48 @@ from std_msgs.msg import Float64, Int32, Int32MultiArray, String
 from tf2_ros import StaticTransformBroadcaster
 from vision_msgs.msg import Detection2D, Detection2DArray, ObjectHypothesisWithPose
 
-# All RGB-derived measurements published by this node carry this frame_id.
-# Future sensors (left/right mono, depth) will get sibling frame_ids.
 FRAME_ID = "oak_d_lite_rgb"
-# Logical root of the OAK-D's internal TF subtree. NOT connected to any
-# robot-body frame here — see docs/vision-architecture.md §4.3.
 DEVICE_FRAME_ID = "oak_d_lite_link"
 
-# Latched QoS: late subscribers immediately receive the most recent message.
-# Used for CameraInfo since intrinsics are static after device-open.
 LATCHED_QOS = QoSProfile(
     depth=1,
     durability=DurabilityPolicy.TRANSIENT_LOCAL,
     history=HistoryPolicy.KEEP_LAST,
 )
 
-# How long to wait between retries when the OAK-D's USB connection is in
-# the "device in use" state (typically right after a prior process closed
-# the connection — USB takes a few seconds to fully release).
 RETRY_DELAY_SECONDS = 5
 
-# --- Face detection capability (sub-step 3.4) -----------------------------
-# Curated zoo model pre-baked at Docker build time per §4.5 of the design
-# doc. blobconverter.from_zoo() at runtime is a cache hit (no network).
+# --- Face detection ---
 FACE_NN_NAME = "face-detection-retail-0004"
 FACE_NN_SHAVES = 6
-FACE_NN_INPUT_SIZE = 300            # the model expects 300x300 RGB
+FACE_NN_INPUT_SIZE = 300
 FACE_NN_CONFIDENCE_THRESHOLD = 0.5
-# vision_msgs/ObjectHypothesis class label. Single class; no class id space
-# to share with other capabilities.
 FACE_CLASS_ID = "face"
 
-# --- Stereo depth capability ------------------------------------------------
-# Uses the OAK-D Lite's dedicated stereo depth engine (not SHAVE cores),
-# so it runs alongside the face NN without contention.
+# --- Face recognition ---
+FACE_REC_NN_NAME = "face-recognition-arcface-112x112"
+FACE_REC_NN_ZOO_TYPE = "depthai"
+FACE_REC_NN_SHAVES = 6
+FACE_REC_INPUT_SIZE = 112
+FACE_REC_SIMILARITY_THRESHOLD = 0.5
+
+# --- Stereo depth ---
 DEPTH_MEDIAN_FILTER = dai.MedianFilter.KERNEL_7x7
 DEPTH_FRAME_ID = "oak_d_lite_depth"
-# Size of the ROI around the queried pixel (in normalized coordinates).
-# A small region averages out noise; 0.02 = ~2% of frame = ~13x14 pixels.
 DEPTH_ROI_HALF_SIZE = 0.01
 
-# Polling interval for subscriber-count gating of lazy capabilities.
-# Trade-off: longer interval = less idle CPU, longer activation latency.
-# 1s is fine for human-driven subscribe events (Cerebra page open, user
-# program start). For event-driven activation we'd switch to MatchedEvent.
 SUBSCRIBER_POLL_PERIOD_S = 1.0
+
+ENROLL_CAPTURE_INTERVAL_S = 0.6
+
+
+def _cosine_similarity(a, b):
+    dot = np.dot(a, b)
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return float(dot / (norm_a * norm_b))
 
 
 class ErrorPublisher(Node):
@@ -88,13 +88,15 @@ class CameraNode(Node):
             CameraInfo, "/vision/camera_info", LATCHED_QOS
         )
 
-        # Lazy capability: face detections (sub-step 3.4). Publishing is gated
-        # by subscriber count via _check_lazy_subscribers() below. NN inference
-        # itself runs on the OAK device unconditionally per the v1 design.
         self.face_detections_pub = self.create_publisher(
             Detection2DArray, "/vision/face_detections", 10
         )
         self._face_publishing = False
+
+        self.face_recognitions_pub = self.create_publisher(
+            Detection2DArray, "/vision/face_recognitions", 10
+        )
+        self._recognition_publishing = False
 
         self.depth_result_pub = self.create_publisher(
             Int32, "/vision/depth_result", 10
@@ -104,6 +106,15 @@ class CameraNode(Node):
             self._on_depth_query, 10,
         )
         self._depth_enabled = False
+
+        self.enroll_face_srv = self.create_service(
+            EnrollFace, "/vision/enroll_face", self._enroll_face_callback
+        )
+        self._enroll_request = None
+        self._enroll_name = ""
+        self._enroll_target_count = 0
+        self._enroll_captured = []
+        self._enroll_last_capture_time = 0.0
 
         self.tf_broadcaster = StaticTransformBroadcaster(self)
 
@@ -117,12 +128,13 @@ class CameraNode(Node):
             Int32MultiArray, "size_topic", self.preview_size_callback, 10
         )
 
-        # Initialize default preview size and quality factor
         self.preview_width = 1280
         self.preview_height = 720
         self.quality_factor = 80
 
-        # Initialize pipeline when camera is available
+        self._known_faces = {}
+        self._load_known_faces()
+
         self.camera_available = self.init_pipeline()
 
         self.current_image = ""
@@ -137,13 +149,100 @@ class CameraNode(Node):
         else:
             self.get_logger().error("Camera not available.")
 
-        self.timer_period = 0.1  # seconds
+        self.timer_period = 0.1
         self.timer = self.create_timer(self.timer_period, self.timer_callback)
 
-        # Subscriber-count poll for lazy capability gating.
         self.subscriber_poll_timer = self.create_timer(
             SUBSCRIBER_POLL_PERIOD_S, self._check_lazy_subscribers
         )
+
+    def _load_known_faces(self):
+        self._known_faces = {}
+        success, data = person_client.get_all_persons()
+        if not success or data is None:
+            self.get_logger().warn("Could not load known faces from API")
+            return
+        for person in data.get("persons", []):
+            person_id = person["personId"]
+            name = person["name"]
+            ok, emb_data = person_client.get_embeddings(person_id)
+            if not ok or emb_data is None:
+                continue
+            embeddings = []
+            for e in emb_data.get("embeddings", []):
+                embeddings.append(np.array(json.loads(e["embedding"]), dtype=np.float32))
+            if embeddings:
+                self._known_faces[name] = embeddings
+        self.get_logger().info(
+            f"Loaded {len(self._known_faces)} known face(s): "
+            f"{list(self._known_faces.keys())}"
+        )
+
+    def _identify_face(self, embedding):
+        best_name = "unknown"
+        best_score = 0.0
+        for name, embeddings in self._known_faces.items():
+            for known_emb in embeddings:
+                score = _cosine_similarity(embedding, known_emb)
+                if score > best_score:
+                    best_score = score
+                    best_name = name
+        if best_score < FACE_REC_SIMILARITY_THRESHOLD:
+            return "unknown", best_score
+        return best_name, best_score
+
+    def _enroll_face_callback(self, request, response):
+        name = request.name.strip()
+        count = max(1, min(request.count, 20))
+        if not name:
+            response.success = False
+            response.captured = 0
+            return response
+
+        self.get_logger().info(f"Enrollment started for '{name}' ({count} embeddings)")
+        self._enroll_name = name
+        self._enroll_target_count = count
+        self._enroll_captured = []
+        self._enroll_last_capture_time = 0.0
+
+        timeout = count * ENROLL_CAPTURE_INTERVAL_S + 10.0
+        start = time.monotonic()
+        while len(self._enroll_captured) < count:
+            if time.monotonic() - start > timeout:
+                self.get_logger().warn("Enrollment timed out")
+                break
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+        success, person_data = person_client.get_all_persons()
+        person_id = None
+        if success and person_data:
+            for p in person_data.get("persons", []):
+                if p["name"] == name:
+                    person_id = p["personId"]
+                    break
+        if person_id is None:
+            ok, new_person = person_client.create_person(name)
+            if ok and new_person:
+                person_id = new_person["personId"]
+
+        stored = 0
+        if person_id:
+            for emb in self._enroll_captured:
+                ok, _ = person_client.add_embedding(person_id, emb.tolist())
+                if ok:
+                    stored += 1
+
+        self._enroll_name = ""
+        self._enroll_target_count = 0
+        self._enroll_captured = []
+
+        if stored > 0:
+            self._load_known_faces()
+
+        self.get_logger().info(f"Enrollment complete for '{name}': {stored} embeddings stored")
+        response.success = stored > 0
+        response.captured = stored
+        return response
 
     def get_camera_image_callback(self, request, response):
         response.image_base64 = self.current_image
@@ -153,20 +252,12 @@ class CameraNode(Node):
         try:
             self.pipeline = dai.Pipeline()
 
-            # Color camera shared by two outputs:
-            #   .video    -> on-device MJPEG encoder (always-on raw_frame topic)
-            #   .preview  -> NN input(s) for face detection (and future capabilities)
             self.camRgb = self.pipeline.createColorCamera()
             self.camRgb.setVideoSize(self.preview_width, self.preview_height)
             self.camRgb.setPreviewSize(FACE_NN_INPUT_SIZE, FACE_NN_INPUT_SIZE)
-            # Stretch the 16:9 sensor frame into the 1:1 NN input. False ->
-            # consumers can recover pixel coords in the video frame by
-            # multiplying normalized bbox coords by (video_width, video_height).
             self.camRgb.setPreviewKeepAspectRatio(False)
             self.camRgb.setInterleaved(False)
 
-            # On-device MJPEG encoder. The OAK has a hardware codec; using it
-            # frees the Pi's CPU from cv2.imencode (~30% -> ~20%).
             self.video_encoder = self.pipeline.createVideoEncoder()
             self.video_encoder.setDefaultProfilePreset(
                 self.camRgb.getFps(),
@@ -175,14 +266,11 @@ class CameraNode(Node):
             self.video_encoder.setQuality(self.quality_factor)
             self.camRgb.video.link(self.video_encoder.input)
 
-            # Stream the encoded JPEG bitstream to the host.
             xout_jpeg = self.pipeline.createXLinkOut()
             xout_jpeg.setStreamName("jpeg")
             self.video_encoder.bitstream.link(xout_jpeg.input)
 
-            # Face detection NN. Always loaded per v1 design (§4.4); the host
-            # only reads the output queue when there are subscribers — see
-            # _check_lazy_subscribers() and timer_callback().
+            # --- Face detection NN ---
             self.face_nn = self.pipeline.createMobileNetDetectionNetwork()
             self.face_nn.setBlobPath(
                 blobconverter.from_zoo(
@@ -197,8 +285,75 @@ class CameraNode(Node):
             xout_face_nn.setStreamName("face_nn")
             self.face_nn.out.link(xout_face_nn.input)
 
-            # Stereo depth with on-device SpatialLocationCalculator.
-            # Only the queried depth value crosses USB (not the full frame).
+            # --- Face recognition two-stage pipeline ---
+            # Copy the preview frame for the Script node
+            copy_manip = self.pipeline.createImageManip()
+            copy_manip.setNumFramesPool(20)
+            copy_manip.setMaxOutputFrameSize(
+                FACE_NN_INPUT_SIZE * FACE_NN_INPUT_SIZE * 3
+            )
+            self.camRgb.preview.link(copy_manip.inputImage)
+
+            # Script node: receives detections + preview frame,
+            # emits crop configs for each detected face
+            script = self.pipeline.createScript()
+            script.setProcessor(dai.ProcessorType.LEON_CSS)
+            self.face_nn.out.link(script.inputs["face_det_in"])
+            copy_manip.out.link(script.inputs["frame"])
+
+            script.setScript("""
+import time
+
+while True:
+    time.sleep(0.001)
+    face_dets = node.io['face_det_in'].tryGet()
+    if face_dets is None:
+        continue
+    img = node.io['frame'].tryGet()
+    if img is None:
+        continue
+    for det in face_dets.detections:
+        xmin = max(0.0, det.xmin)
+        ymin = max(0.0, det.ymin)
+        xmax = min(1.0, det.xmax)
+        ymax = min(1.0, det.ymax)
+        if xmax - xmin < 0.01 or ymax - ymin < 0.01:
+            continue
+        cfg = ImageManipConfig()
+        cfg.setCropRect(xmin, ymin, xmax, ymax)
+        cfg.setResize(112, 112)
+        cfg.setKeepAspectRatio(False)
+        node.io['manip_cfg'].send(cfg)
+        node.io['manip_img'].send(img)
+""")
+
+            # Face recognition ImageManip: crops and resizes each face
+            face_rec_manip = self.pipeline.createImageManip()
+            face_rec_manip.initialConfig.setResize(
+                FACE_REC_INPUT_SIZE, FACE_REC_INPUT_SIZE
+            )
+            face_rec_manip.setWaitForConfigInput(True)
+            face_rec_manip.inputImage.setQueueSize(20)
+
+            script.outputs["manip_cfg"].link(face_rec_manip.inputConfig)
+            script.outputs["manip_img"].link(face_rec_manip.inputImage)
+
+            # Face recognition NN
+            face_rec_nn = self.pipeline.createNeuralNetwork()
+            face_rec_nn.setBlobPath(
+                blobconverter.from_zoo(
+                    name=FACE_REC_NN_NAME,
+                    zoo_type=FACE_REC_NN_ZOO_TYPE,
+                    shaves=FACE_REC_NN_SHAVES,
+                )
+            )
+            face_rec_manip.out.link(face_rec_nn.input)
+
+            xout_face_rec = self.pipeline.createXLinkOut()
+            xout_face_rec.setStreamName("face_rec")
+            face_rec_nn.out.link(xout_face_rec.input)
+
+            # --- Stereo depth ---
             mono_left = self.pipeline.createMonoCamera()
             mono_left.setResolution(
                 dai.MonoCameraProperties.SensorResolution.THE_480_P
@@ -241,7 +396,7 @@ class CameraNode(Node):
             xout_spatial.setStreamName("spatial_data")
             spatial_calc.out.link(xout_spatial.input)
 
-            # Try to connect to device.
+            # --- Connect to device ---
             self.device = dai.Device(self.pipeline)
             self.queue = self.device.getOutputQueue(
                 name="jpeg", maxSize=4, blocking=False
@@ -249,12 +404,17 @@ class CameraNode(Node):
             self.face_nn_queue = self.device.getOutputQueue(
                 name="face_nn", maxSize=4, blocking=False
             )
+            self.face_rec_queue = self.device.getOutputQueue(
+                name="face_rec", maxSize=4, blocking=False
+            )
             self.spatial_cfg_queue = self.device.getInputQueue(
                 name="spatial_cfg"
             )
             self.spatial_data_queue = self.device.getOutputQueue(
                 name="spatial_data", maxSize=4, blocking=False
             )
+
+            self.get_logger().info("Face recognition NN loaded")
             return True
 
         except Exception as e:
@@ -262,12 +422,12 @@ class CameraNode(Node):
             self.device = None
             self.queue = None
             self.face_nn_queue = None
+            self.face_rec_queue = None
             self.spatial_cfg_queue = None
             self.spatial_data_queue = None
             return False
 
     def publish_camera_info(self):
-        """Publish a latched CameraInfo built from the OAK-D's on-device calibration."""
         try:
             calib = self.device.readCalibration()
             K = calib.getCameraIntrinsics(
@@ -283,14 +443,10 @@ class CameraNode(Node):
         msg.header.frame_id = FRAME_ID
         msg.width = self.preview_width
         msg.height = self.preview_height
-        # depthai returns 14 distortion coefficients; OpenCV's plumb_bob model
-        # uses the first 5 (k1, k2, p1, p2, k3).
         msg.distortion_model = "plumb_bob"
         msg.d = [float(d) for d in distortion[:5]]
         msg.k = [float(v) for row in K for v in row]
-        # No rectification for a single (non-stereo) camera.
         msg.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-        # Projection P = [K | 0] for an unrectified single camera.
         msg.p = [
             float(K[0][0]), float(K[0][1]), float(K[0][2]), 0.0,
             float(K[1][0]), float(K[1][1]), float(K[1][2]), 0.0,
@@ -303,21 +459,10 @@ class CameraNode(Node):
         )
 
     def publish_static_transforms(self):
-        """Publish the OAK-D's internal TF subtree.
-
-        v1: a single identity transform oak_d_lite_link -> oak_d_lite_rgb.
-        Future stereo/depth capabilities add sibling transforms here using
-        depthai's `getCameraExtrinsics()` for the actual physical offsets.
-
-        Intentionally does NOT connect oak_d_lite_link to any robot-body
-        frame (e.g. pib_base_link) — that is owned by a future
-        robot-description publisher with the actual mounting measurement.
-        """
         t = TransformStamped()
         t.header.stamp = self.get_clock().now().to_msg()
         t.header.frame_id = DEVICE_FRAME_ID
         t.child_frame_id = FRAME_ID
-        # Identity: translation defaults to (0,0,0); set quaternion to (0,0,0,1).
         t.transform.rotation.w = 1.0
         t_depth = TransformStamped()
         t_depth.header.stamp = t.header.stamp
@@ -334,7 +479,7 @@ class CameraNode(Node):
     def timer_callback(self):
         if not self.queue:
             return
-        jpeg_pkt = self.queue.tryGet()  # already MJPEG-encoded by the OAK
+        jpeg_pkt = self.queue.tryGet()
         if jpeg_pkt is None:
             return
 
@@ -343,7 +488,6 @@ class CameraNode(Node):
 
         stamp = self.get_clock().now().to_msg()
 
-        # /vision/raw_frame (binary CompressedImage, ROS-native)
         compressed_msg = CompressedImage()
         compressed_msg.header.stamp = stamp
         compressed_msg.header.frame_id = FRAME_ID
@@ -351,28 +495,21 @@ class CameraNode(Node):
         compressed_msg.data = jpg_bytes
         self.raw_frame_pub.publish(compressed_msg)
 
-        # /vision/raw_frame_b64 (String, for Cerebra via rosbridge)
         b64_msg = String()
         b64_msg.data = jpg_b64
         self.raw_frame_b64_pub.publish(b64_msg)
         self.current_image = jpg_b64
 
-        # Lazy: face detections, gated by subscriber count. The NN itself
-        # keeps running on-device whether or not we read its output.
         if self._face_publishing:
             self._publish_face_detections(stamp)
+
+        if self._recognition_publishing or self._enroll_name:
+            self._publish_face_recognitions(stamp)
 
         if self._depth_enabled:
             self._poll_depth_results()
 
     def _publish_face_detections(self, stamp):
-        """Drain the NN output queue and publish a Detection2DArray.
-
-        Bbox coordinates from depthai are normalized [0..1] of the NN input
-        frame (which is the camera preview, stretched to 1:1). We publish in
-        pixel coordinates of the raw_frame (camRgb.video size) so consumers
-        can correlate detections with the published image.
-        """
         nn_pkt = self.face_nn_queue.tryGet()
         if nn_pkt is None:
             return
@@ -401,6 +538,64 @@ class CameraNode(Node):
             msg.detections.append(d)
 
         self.face_detections_pub.publish(msg)
+
+    def _publish_face_recognitions(self, stamp):
+        rec_pkt = self.face_rec_queue.tryGet()
+        if rec_pkt is None:
+            return
+
+        embedding = np.array(rec_pkt.getFirstLayerFp16(), dtype=np.float32)
+
+        # During enrollment, capture this embedding
+        if self._enroll_name and len(self._enroll_captured) < self._enroll_target_count:
+            now = time.monotonic()
+            if now - self._enroll_last_capture_time >= ENROLL_CAPTURE_INTERVAL_S:
+                self._enroll_captured.append(embedding.copy())
+                self._enroll_last_capture_time = now
+                self.get_logger().info(
+                    f"Enrollment capture {len(self._enroll_captured)}/"
+                    f"{self._enroll_target_count} for '{self._enroll_name}'"
+                )
+
+        if not self._recognition_publishing:
+            return
+
+        name, score = self._identify_face(embedding)
+
+        # We get one embedding per detected face from the Script node,
+        # but we don't have the bbox here. Use the latest face_nn detection
+        # to pair them. For single-face scenarios this is straightforward;
+        # multi-face requires sequencing alignment (v2 improvement).
+        nn_pkt = self.face_nn_queue.tryGet()
+
+        msg = Detection2DArray()
+        msg.header.stamp = stamp
+        msg.header.frame_id = FRAME_ID
+
+        d = Detection2D()
+        d.header = msg.header
+
+        if nn_pkt is not None and nn_pkt.detections:
+            det = max(
+                nn_pkt.detections,
+                key=lambda det: (det.xmax - det.xmin) * (det.ymax - det.ymin),
+            )
+            d.bbox.center.position.x = (
+                (det.xmin + det.xmax) / 2.0 * self.preview_width
+            )
+            d.bbox.center.position.y = (
+                (det.ymin + det.ymax) / 2.0 * self.preview_height
+            )
+            d.bbox.size_x = (det.xmax - det.xmin) * self.preview_width
+            d.bbox.size_y = (det.ymax - det.ymin) * self.preview_height
+
+        hyp = ObjectHypothesisWithPose()
+        hyp.hypothesis.class_id = name
+        hyp.hypothesis.score = score
+        d.results.append(hyp)
+        msg.detections.append(d)
+
+        self.face_recognitions_pub.publish(msg)
 
     def _on_depth_query(self, msg):
         if not self._depth_enabled or self.spatial_cfg_queue is None:
@@ -439,9 +634,6 @@ class CameraNode(Node):
         self.depth_result_pub.publish(msg)
 
     def _check_lazy_subscribers(self):
-        """Toggle publishing flags for lazy capabilities based on whether
-        anyone is subscribed. Runs every SUBSCRIBER_POLL_PERIOD_S seconds.
-        """
         face_subs = self.face_detections_pub.get_subscription_count()
         if face_subs > 0 and not self._face_publishing:
             self._face_publishing = True
@@ -453,6 +645,19 @@ class CameraNode(Node):
             self._face_publishing = False
             self.get_logger().info(
                 "No face detection consumers; pausing /vision/face_detections"
+            )
+
+        rec_subs = self.face_recognitions_pub.get_subscription_count()
+        if rec_subs > 0 and not self._recognition_publishing:
+            self._recognition_publishing = True
+            self.get_logger().info(
+                f"Face recognition consumers appeared ({rec_subs}); "
+                "publishing /vision/face_recognitions"
+            )
+        elif rec_subs == 0 and self._recognition_publishing:
+            self._recognition_publishing = False
+            self.get_logger().info(
+                "No face recognition consumers; pausing /vision/face_recognitions"
             )
 
         depth_subs = self.depth_result_pub.get_subscription_count()
@@ -470,26 +675,20 @@ class CameraNode(Node):
 
     def timer_period_callback(self, msg):
         self.timer_period = msg.data
-        self.timer.cancel()  # cancel the old timer
+        self.timer.cancel()
         self.timer = self.create_timer(
             self.timer_period, self.timer_callback
-        )  # create a new timer with updated period
+        )
 
     def quality_factor_callback(self, msg):
         self.quality_factor = msg.data
-        # MJPEG quality is baked into the on-device VideoEncoder at pipeline
-        # build, so applying a new value requires rebuilding. Causes a brief
-        # streaming interruption (~1-2s) — acceptable for a tuning op.
         self.device.close()
         self.init_pipeline()
 
     def preview_size_callback(self, msg):
         self.preview_width, self.preview_height = msg.data
-
-        # Reset pipeline with new preview size
         self.device.close()
         if self.init_pipeline():
-            # CameraInfo dimensions (and possibly intrinsics) changed — re-publish.
             self.publish_camera_info()
 
 
@@ -504,10 +703,6 @@ def spin_camera(times):
     try:
         camera_node = CameraNode()
         if not camera_node.camera_available:
-            # init_pipeline failed (commonly "device in use" right after a
-            # restart). Trigger the retry path below by raising — without
-            # this, rclpy.spin would block forever on a node with no
-            # working pipeline.
             raise RuntimeError("OAK-D pipeline init failed; will retry")
         rclpy.spin(camera_node)
     except Exception as exc:
