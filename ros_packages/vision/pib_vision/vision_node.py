@@ -38,7 +38,7 @@ FACE_CLASS_ID = "face"
 # --- Face recognition ---
 FACE_REC_NN_NAME = "face-recognition-arcface-112x112"
 FACE_REC_NN_ZOO_TYPE = "depthai"
-FACE_REC_NN_SHAVES = 6
+FACE_REC_NN_SHAVES = 4
 FACE_REC_INPUT_SIZE = 112
 FACE_REC_SIMILARITY_THRESHOLD = 0.5
 
@@ -288,7 +288,7 @@ class CameraNode(Node):
             # --- Face recognition two-stage pipeline ---
             # Copy the preview frame for the Script node
             copy_manip = self.pipeline.createImageManip()
-            copy_manip.setNumFramesPool(20)
+            copy_manip.setNumFramesPool(4)
             copy_manip.setMaxOutputFrameSize(
                 FACE_NN_INPUT_SIZE * FACE_NN_INPUT_SIZE * 3
             )
@@ -333,7 +333,7 @@ while True:
                 FACE_REC_INPUT_SIZE, FACE_REC_INPUT_SIZE
             )
             face_rec_manip.setWaitForConfigInput(True)
-            face_rec_manip.inputImage.setQueueSize(20)
+            face_rec_manip.inputImage.setQueueSize(4)
 
             script.outputs["manip_cfg"].link(face_rec_manip.inputConfig)
             script.outputs["manip_img"].link(face_rec_manip.inputImage)
