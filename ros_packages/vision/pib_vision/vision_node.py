@@ -10,6 +10,10 @@ import rclpy
 from datatypes.srv import EnrollFace, GetCameraImage
 from geometry_msgs.msg import TransformStamped
 from pib_api_client import person_client
+import threading
+
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
 from sensor_msgs.msg import CameraInfo, CompressedImage
@@ -107,14 +111,16 @@ class CameraNode(Node):
         )
         self._depth_enabled = False
 
+        self._enroll_cb_group = MutuallyExclusiveCallbackGroup()
         self.enroll_face_srv = self.create_service(
-            EnrollFace, "/vision/enroll_face", self._enroll_face_callback
+            EnrollFace, "/vision/enroll_face", self._enroll_face_callback,
+            callback_group=self._enroll_cb_group,
         )
-        self._enroll_request = None
         self._enroll_name = ""
         self._enroll_target_count = 0
         self._enroll_captured = []
         self._enroll_last_capture_time = 0.0
+        self._enroll_done = threading.Event()
 
         self.tf_broadcaster = StaticTransformBroadcaster(self)
 
@@ -200,18 +206,15 @@ class CameraNode(Node):
             return response
 
         self.get_logger().info(f"Enrollment started for '{name}' ({count} embeddings)")
+        self._enroll_done.clear()
         self._enroll_name = name
         self._enroll_target_count = count
         self._enroll_captured = []
         self._enroll_last_capture_time = 0.0
 
         timeout = count * ENROLL_CAPTURE_INTERVAL_S + 10.0
-        start = time.monotonic()
-        while len(self._enroll_captured) < count:
-            if time.monotonic() - start > timeout:
-                self.get_logger().warn("Enrollment timed out")
-                break
-            rclpy.spin_once(self, timeout_sec=0.1)
+        if not self._enroll_done.wait(timeout=timeout):
+            self.get_logger().warn("Enrollment timed out")
 
         success, person_data = person_client.get_all_persons()
         person_id = None
@@ -556,6 +559,8 @@ while True:
                     f"Enrollment capture {len(self._enroll_captured)}/"
                     f"{self._enroll_target_count} for '{self._enroll_name}'"
                 )
+                if len(self._enroll_captured) >= self._enroll_target_count:
+                    self._enroll_done.set()
 
         if not self._recognition_publishing:
             return
@@ -704,7 +709,9 @@ def spin_camera(times):
         camera_node = CameraNode()
         if not camera_node.camera_available:
             raise RuntimeError("OAK-D pipeline init failed; will retry")
-        rclpy.spin(camera_node)
+        executor = MultiThreadedExecutor()
+        executor.add_node(camera_node)
+        executor.spin()
     except Exception as exc:
         error_publisher.timer_callback()
         print(exc)
