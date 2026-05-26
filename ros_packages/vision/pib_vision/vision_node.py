@@ -289,32 +289,17 @@ class CameraNode(Node):
             self.face_nn.out.link(xout_face_nn.input)
 
             # --- Face recognition two-stage pipeline ---
-            # Copy the preview frame for the Script node
-            copy_manip = self.pipeline.createImageManip()
-            copy_manip.setNumFramesPool(4)
-            copy_manip.setMaxOutputFrameSize(
-                FACE_NN_INPUT_SIZE * FACE_NN_INPUT_SIZE * 3
-            )
-            self.camRgb.preview.link(copy_manip.inputImage)
-
-            # Script node: receives detections + preview frame,
-            # emits crop configs for each detected face
+            # Use passthrough to get the exact frame the detection NN processed
+            # (guarantees detection/frame synchronisation, no extra ImageManip)
             script = self.pipeline.createScript()
             script.setProcessor(dai.ProcessorType.LEON_CSS)
             self.face_nn.out.link(script.inputs["face_det_in"])
-            copy_manip.out.link(script.inputs["frame"])
+            self.face_nn.passthrough.link(script.inputs["frame"])
 
             script.setScript("""
-import time
-
 while True:
-    time.sleep(0.001)
-    face_dets = node.io['face_det_in'].tryGet()
-    if face_dets is None:
-        continue
-    img = node.io['frame'].tryGet()
-    if img is None:
-        continue
+    face_dets = node.io['face_det_in'].get()
+    img = node.io['frame'].get()
     for det in face_dets.detections:
         xmin = max(0.0, det.xmin)
         ymin = max(0.0, det.ymin)
