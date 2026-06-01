@@ -44,7 +44,7 @@ FACE_REC_NN_NAME = "face-recognition-arcface-112x112"
 FACE_REC_NN_ZOO_TYPE = "depthai"
 FACE_REC_NN_SHAVES = 4
 FACE_REC_INPUT_SIZE = 112
-FACE_REC_SIMILARITY_THRESHOLD = 0.5
+FACE_REC_SIMILARITY_THRESHOLD = 0.65
 
 # --- Stereo depth ---
 DEPTH_MEDIAN_FILTER = dai.MedianFilter.KERNEL_7x7
@@ -140,6 +140,8 @@ class CameraNode(Node):
 
         self._known_faces = {}
         self._load_known_faces()
+        self._active_tracklets = []
+        self._tracked_identities = {}
 
         self.camera_available = self.init_pipeline()
 
@@ -288,9 +290,30 @@ class CameraNode(Node):
             xout_face_nn.setStreamName("face_nn")
             self.face_nn.out.link(xout_face_nn.input)
 
+            # --- Object tracker (persistent face IDs across frames) ---
+            # All inputs non-blocking so tracker cannot stall the pipeline.
+            tracker = self.pipeline.createObjectTracker()
+            tracker.setDetectionLabelsToTrack([1])
+            tracker.setTrackerType(dai.TrackerType.ZERO_TERM_IMAGELESS)
+            tracker.setTrackerIdAssignmentPolicy(
+                dai.TrackerIdAssignmentPolicy.SMALLEST_ID
+            )
+            tracker.inputDetections.setBlocking(False)
+            tracker.inputDetections.setQueueSize(1)
+            tracker.inputDetectionFrame.setBlocking(False)
+            tracker.inputDetectionFrame.setQueueSize(1)
+            tracker.inputTrackerFrame.setBlocking(False)
+            tracker.inputTrackerFrame.setQueueSize(1)
+            self.face_nn.out.link(tracker.inputDetections)
+            self.face_nn.passthrough.link(tracker.inputDetectionFrame)
+            self.camRgb.preview.link(tracker.inputTrackerFrame)
+
+            xout_tracker = self.pipeline.createXLinkOut()
+            xout_tracker.setStreamName("tracker")
+            tracker.out.link(xout_tracker.input)
+
             # --- Face recognition two-stage pipeline ---
             # Use passthrough to get the exact frame the detection NN processed
-            # (guarantees detection/frame synchronisation, no extra ImageManip)
             script = self.pipeline.createScript()
             script.setProcessor(dai.ProcessorType.LEON_CSS)
             self.face_nn.out.link(script.inputs["face_det_in"])
@@ -389,6 +412,9 @@ while True:
             self.queue = self.device.getOutputQueue(
                 name="jpeg", maxSize=4, blocking=False
             )
+            self.tracker_queue = self.device.getOutputQueue(
+                name="tracker", maxSize=4, blocking=False
+            )
             self.face_nn_queue = self.device.getOutputQueue(
                 name="face_nn", maxSize=4, blocking=False
             )
@@ -409,6 +435,7 @@ while True:
             self.get_logger().error(f"Camera not found: {e}")
             self.device = None
             self.queue = None
+            self.tracker_queue = None
             self.face_nn_queue = None
             self.face_rec_queue = None
             self.spatial_cfg_queue = None
@@ -488,14 +515,31 @@ while True:
         self.raw_frame_b64_pub.publish(b64_msg)
         self.current_image = jpg_b64
 
+        if self._face_publishing or self._recognition_publishing or self._enroll_name:
+            self._update_tracked_faces()
+
         if self._face_publishing:
             self._publish_face_detections(stamp)
 
         if self._recognition_publishing or self._enroll_name:
+            self._process_recognition_embeddings()
+
+        if self._recognition_publishing:
             self._publish_face_recognitions(stamp)
 
         if self._depth_enabled:
             self._poll_depth_results()
+
+    def _update_tracked_faces(self):
+        tracker_pkt = self.tracker_queue.tryGet()
+        if tracker_pkt is None:
+            return
+        self._active_tracklets = []
+        for t in tracker_pkt.tracklets:
+            if t.status == dai.Tracklet.TrackingStatus.REMOVED:
+                self._tracked_identities.pop(t.id, None)
+            elif t.status != dai.Tracklet.TrackingStatus.LOST:
+                self._active_tracklets.append(t)
 
     def _publish_face_detections(self, stamp):
         nn_pkt = self.face_nn_queue.tryGet()
@@ -527,14 +571,13 @@ while True:
 
         self.face_detections_pub.publish(msg)
 
-    def _publish_face_recognitions(self, stamp):
+    def _process_recognition_embeddings(self):
         rec_pkt = self.face_rec_queue.tryGet()
         if rec_pkt is None:
             return
 
         embedding = np.array(rec_pkt.getFirstLayerFp16(), dtype=np.float32)
 
-        # During enrollment, capture this embedding
         if self._enroll_name and len(self._enroll_captured) < self._enroll_target_count:
             now = time.monotonic()
             if now - self._enroll_last_capture_time >= ENROLL_CAPTURE_INTERVAL_S:
@@ -547,29 +590,26 @@ while True:
                 if len(self._enroll_captured) >= self._enroll_target_count:
                     self._enroll_done.set()
 
-        if not self._recognition_publishing:
-            return
-
         name, score = self._identify_face(embedding)
+        if name != "unknown" and self._active_tracklets:
+            largest = max(
+                self._active_tracklets,
+                key=lambda t: (
+                    (t.srcImgDetection.xmax - t.srcImgDetection.xmin)
+                    * (t.srcImgDetection.ymax - t.srcImgDetection.ymin)
+                ),
+            )
+            self._tracked_identities[largest.id] = (name, score)
 
-        # We get one embedding per detected face from the Script node,
-        # but we don't have the bbox here. Use the latest face_nn detection
-        # to pair them. For single-face scenarios this is straightforward;
-        # multi-face requires sequencing alignment (v2 improvement).
-        nn_pkt = self.face_nn_queue.tryGet()
-
+    def _publish_face_recognitions(self, stamp):
         msg = Detection2DArray()
         msg.header.stamp = stamp
         msg.header.frame_id = FRAME_ID
 
-        d = Detection2D()
-        d.header = msg.header
-
-        if nn_pkt is not None and nn_pkt.detections:
-            det = max(
-                nn_pkt.detections,
-                key=lambda det: (det.xmax - det.xmin) * (det.ymax - det.ymin),
-            )
+        for t in self._active_tracklets:
+            det = t.srcImgDetection
+            d = Detection2D()
+            d.header = msg.header
             d.bbox.center.position.x = (
                 (det.xmin + det.xmax) / 2.0 * self.preview_width
             )
@@ -579,11 +619,12 @@ while True:
             d.bbox.size_x = (det.xmax - det.xmin) * self.preview_width
             d.bbox.size_y = (det.ymax - det.ymin) * self.preview_height
 
-        hyp = ObjectHypothesisWithPose()
-        hyp.hypothesis.class_id = name
-        hyp.hypothesis.score = score
-        d.results.append(hyp)
-        msg.detections.append(d)
+            cached = self._tracked_identities.get(t.id, ("unknown", 0.0))
+            hyp = ObjectHypothesisWithPose()
+            hyp.hypothesis.class_id = cached[0]
+            hyp.hypothesis.score = cached[1]
+            d.results.append(hyp)
+            msg.detections.append(d)
 
         self.face_recognitions_pub.publish(msg)
 

@@ -102,9 +102,16 @@ EMOTIONS: dict[str, EmotionState] = {
         extra=ExtraAnimation(kind="sleeping_zzz"),
     ),
     "curious": EmotionState(
-        left_eye=EyeParams(_LE_CX, _EYE_CY - 0.01, _EYE_RX * 1.05, _EYE_RY * 1.15),
-        right_eye=EyeParams(_RE_CX, _EYE_CY - 0.02, _EYE_RX * 1.12, _EYE_RY * 1.22),
-        mouth=MouthParams(0.5, 0.87, 0.06, 0.0, openness=0.05, visible=True),
+        left_eye=EyeParams(_LE_CX, _EYE_CY, _EYE_RX, _EYE_RY * 1.1),
+        right_eye=EyeParams(_RE_CX, _EYE_CY + 0.03, _EYE_RX * 0.95, _EYE_RY * 0.85, squint_bottom=0.10),
+        right_brow=BrowParams(_RE_CX, _EYE_CY - 0.28, 0.09, angle=-10.0, visible=True),
+    ),
+    "focused": EmotionState(
+        left_eye=EyeParams(_LE_CX, _EYE_CY, _EYE_RX * 1.4, _EYE_RY * 0.55),
+        right_eye=EyeParams(_RE_CX, _EYE_CY, _EYE_RX * 1.4, _EYE_RY * 0.55),
+        left_brow=BrowParams(_LE_CX, _EYE_CY - 0.20, 0.11, angle=-4.0, visible=True),
+        right_brow=BrowParams(_RE_CX, _EYE_CY - 0.20, 0.11, angle=4.0, visible=True),
+        mouth=MouthParams(0.5, 0.88, 0.06, 0.0, openness=0.05, visible=True),
     ),
     "thinking": EmotionState(
         left_eye=EyeParams(_LE_CX + 0.03, _EYE_CY - 0.02, _EYE_RX * 0.9, _EYE_RY * 0.8, squint_bottom=0.15),
